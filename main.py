@@ -83,7 +83,7 @@ async def extract_tables(
         # Run the extraction script
         cmd = [
             sys.executable,
-            "table_extractor.py",
+            "enterprise_table_extractor_full.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
@@ -193,7 +193,7 @@ async def extract_images(
         # Run the extraction script
         cmd = [
             sys.executable,
-            "image_extractor.py",
+            "enterprise_image_extractor.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
