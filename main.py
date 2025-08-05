@@ -279,6 +279,164 @@ async def extract_images(
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+@app.post("/extract/all")
+async def extract_all(
+    file: UploadFile = File(...),
+    min_quality: float = 0.3,
+    workers: int = 4,
+    min_width: int = 100,
+    min_height: int = 100,
+    token: str = Depends(verify_token)
+):
+    """Extract both tables and images from PDF - mimics the original orchestrator script"""
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        # Save uploaded file
+        pdf_path = os.path.join(temp_dir, "input.pdf")
+        with open(pdf_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # Create output directories
+        tables_dir = os.path.join(temp_dir, "pdf_tables")
+        images_dir = os.path.join(temp_dir, "pdf_images")
+        os.makedirs(tables_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        
+        all_results = []
+        
+        # Extract tables
+        logger.info("Extracting tables...")
+        table_cmd = [
+            sys.executable,
+            "enterprise_table_extractor_full.py",
+            pdf_path,
+            "--output-dir", tables_dir,
+            "--workers", str(workers),
+            "--min-quality", str(min_quality),
+            "--clear-output"
+        ]
+        
+        try:
+            table_result = subprocess.run(
+                table_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            
+            if table_result.returncode == 0:
+                # Read table metadata
+                table_metadata_path = os.path.join(tables_dir, "extraction_metadata.json")
+                if os.path.exists(table_metadata_path):
+                    with open(table_metadata_path, 'r') as f:
+                        table_metadata = json.load(f)
+                    
+                    for table_info in table_metadata.get('tables', []):
+                        # Format exactly as the original Python script
+                        result_item = {
+                            "type": "table",
+                            "page": table_info['page_number'],
+                            "index": table_info['table_index'],
+                            "filePath": f"/data/pdf_tables/{table_info['filename']}",
+                            "fileName": table_info['filename'],
+                            "table_type": table_info.get('table_type', 'general_data'),
+                            "quality_score": table_info.get('quality_score', 0.0),
+                            "extraction_method": table_info.get('extraction_method', 'unknown'),
+                            "rows": table_info.get('rows', 0),
+                            "columns": table_info.get('columns', 0),
+                            "size_bytes": table_info.get('size_bytes', 0),
+                            "has_headers": table_info.get('has_headers', True),
+                            "numeric_percentage": table_info.get('numeric_percentage', 0),
+                            "empty_cell_percentage": table_info.get('empty_cell_percentage', 0),
+                            "metadata": table_info.get('metadata', {}),
+                            "mimeType": "text/csv"
+                        }
+                        
+                        all_results.append(result_item)
+                        
+        except subprocess.TimeoutExpired:
+            logger.error("Table extraction timed out")
+        except Exception as e:
+            logger.error(f"Table extraction error: {e}")
+        
+        # Extract images
+        logger.info("Extracting images...")
+        image_cmd = [
+            sys.executable,
+            "enterprise_image_extractor.py",
+            pdf_path,
+            "--output-dir", images_dir,
+            "--workers", str(workers),
+            "--min-width", str(min_width),
+            "--min-height", str(min_height),
+            "--min-quality", str(min_quality),
+            "--vector-threshold", "10",
+            "--clear-output"
+        ]
+        
+        try:
+            image_result = subprocess.run(
+                image_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            
+            if image_result.returncode == 0:
+                # Read image metadata
+                image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
+                if os.path.exists(image_metadata_path):
+                    with open(image_metadata_path, 'r') as f:
+                        image_metadata = json.load(f)
+                    
+                    for img_info in image_metadata.get('images', []):
+                        # Format exactly as the original Python script
+                        result_item = {
+                            "type": "image",
+                            "page": img_info['page_number'],
+                            "index": img_info['image_index'],
+                            "filePath": f"/data/pdf_images/{img_info['filename']}",
+                            "fileName": img_info['filename'],
+                            "image_type": img_info.get('image_type', 'general_image'),
+                            "extraction_method": img_info.get('extraction_method', 'unknown'),
+                            "quality_score": img_info.get('quality_score', 0.0),
+                            "width": img_info.get('width', 0),
+                            "height": img_info.get('height', 0),
+                            "has_text": img_info.get('has_text', False),
+                            "text_content": img_info.get('text_content', ''),
+                            "caption": img_info.get('context', {}).get('caption'),
+                            "figure_reference": img_info.get('context', {}).get('figure_reference'),
+                            "visual_elements": img_info.get('visual_elements', {}),
+                            "vector_count": img_info.get('vector_count'),
+                            "enhancement_applied": img_info.get('enhancement_applied', False),
+                            "mimeType": "image/png"
+                        }
+                        
+                        all_results.append(result_item)
+                        
+        except subprocess.TimeoutExpired:
+            logger.error("Image extraction timed out")
+        except Exception as e:
+            logger.error(f"Image extraction error: {e}")
+        
+        # Sort results by page and index (like the original script)
+        all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
+        
+        # Return the results array directly (matching the original stdout format)
+        return JSONResponse(content=all_results)
+        
+    except Exception as e:
+        logger.error(f"Extraction error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction error: {str(e)}"
+        )
+    finally:
+        # Cleanup
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
 @app.get("/test")
 async def test_endpoint():
     """Simple test endpoint that doesn't require auth"""
