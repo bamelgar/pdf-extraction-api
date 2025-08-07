@@ -460,8 +460,13 @@ async def extract_all(
         logger.info(f"Total results: {len(all_results)} items")
         
         # Return the results array directly (matching the original stdout format)
-        return JSONResponse(content=all_results)
-        
+        # Force it to always be an array by wrapping in a response object
+        return {
+          "results": all_results,
+          "count": len(all_results),
+          "extraction_timestamp": datetime.now().isoformat()
+        }
+    
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}", exc_info=True)
         raise HTTPException(
