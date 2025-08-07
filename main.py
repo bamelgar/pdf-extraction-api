@@ -424,7 +424,69 @@ async def extract_all(
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
         
         # Return the results array directly (matching the original stdout format)
-        return JSONResponse(content=all_results)
+        return JSONResponse(content=all_results)@app.get("/debug/check-environment")
+async def check_environment():
+    """Check if Python environment is set up correctly"""
+    checks = {
+        "python_version": sys.version,
+        "current_directory": os.getcwd(),
+        "scripts_exist": {
+            "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
+            "image_extractor": os.path.exists("enterprise_image_extractor.py")
+        },
+        "installed_packages": []
+    }
+    
+    # Check for required packages
+    required_packages = [
+        "pdfplumber", "pandas", "numpy", "camelot-py", 
+        "tabula-py", "PyMuPDF", "PIL", "cv2", "pytesseract"
+    ]
+    
+    for package in required_packages:
+        try:
+            if package == "PyMuPDF":
+                __import__("fitz")
+            elif package == "PIL":
+                __import__("PIL.Image")
+            elif package == "cv2":
+                __import__("cv2")
+            elif package == "camelot-py":
+                __import__("camelot")
+            elif package == "tabula-py":
+                __import__("tabula")
+            else:
+                __import__(package)
+            checks["installed_packages"].append({"package": package, "installed": True})
+        except ImportError:
+            checks["installed_packages"].append({"package": package, "installed": False})
+    
+    # Check for system dependencies
+    checks["system_checks"] = {
+        "java_available": shutil.which("java") is not None,
+        "tesseract_available": shutil.which("tesseract") is not None
+    }
+    
+    # List files in current directory
+    checks["files_in_directory"] = os.listdir(".")
+    
+    # Test simple extraction
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import pdfplumber; print('pdfplumber works')"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        checks["test_import"] = {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+    except Exception as e:
+        checks["test_import"] = {"error": str(e)}
+    
+    return checks
         
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}", exc_info=True)
@@ -445,6 +507,8 @@ async def test_endpoint():
         "timestamp": datetime.now().isoformat(),
         "python_version": sys.version
     }
+
+
 
 if __name__ == "__main__":
     import uvicorn
