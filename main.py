@@ -297,6 +297,10 @@ async def extract_all(
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
         
+        # Log file details
+        file_size = os.path.getsize(pdf_path)
+        logger.info(f"Processing PDF: {file.filename}, Size: {file_size} bytes, Temp path: {pdf_path}")
+        
         # Create output directories
         tables_dir = os.path.join(temp_dir, "pdf_tables")
         images_dir = os.path.join(temp_dir, "pdf_images")
@@ -317,6 +321,8 @@ async def extract_all(
             "--clear-output"
         ]
         
+        logger.info(f"Running command: {' '.join(table_cmd)}")
+        
         try:
             table_result = subprocess.run(
                 table_cmd,
@@ -325,12 +331,23 @@ async def extract_all(
                 timeout=300
             )
             
+            logger.info(f"Table extraction exit code: {table_result.returncode}")
+            logger.info(f"Table stdout (first 500 chars): {table_result.stdout[:500]}")
+            if table_result.stderr:
+                logger.error(f"Table stderr: {table_result.stderr[:1000]}")
+            
             if table_result.returncode == 0:
+                # List files in output directory
+                table_files = os.listdir(tables_dir)
+                logger.info(f"Files in tables directory: {table_files}")
+                
                 # Read table metadata
                 table_metadata_path = os.path.join(tables_dir, "extraction_metadata.json")
                 if os.path.exists(table_metadata_path):
                     with open(table_metadata_path, 'r') as f:
                         table_metadata = json.load(f)
+                    
+                    logger.info(f"Found {len(table_metadata.get('tables', []))} tables in metadata")
                     
                     for table_info in table_metadata.get('tables', []):
                         # Format exactly as the original Python script
@@ -354,11 +371,13 @@ async def extract_all(
                         }
                         
                         all_results.append(result_item)
+                else:
+                    logger.warning("No table metadata file found")
                         
         except subprocess.TimeoutExpired:
             logger.error("Table extraction timed out")
         except Exception as e:
-            logger.error(f"Table extraction error: {e}")
+            logger.error(f"Table extraction error: {e}", exc_info=True)
         
         # Extract images
         logger.info("Extracting images...")
@@ -375,6 +394,8 @@ async def extract_all(
             "--clear-output"
         ]
         
+        logger.info(f"Running command: {' '.join(image_cmd)}")
+        
         try:
             image_result = subprocess.run(
                 image_cmd,
@@ -383,12 +404,23 @@ async def extract_all(
                 timeout=300
             )
             
+            logger.info(f"Image extraction exit code: {image_result.returncode}")
+            logger.info(f"Image stdout (first 500 chars): {image_result.stdout[:500]}")
+            if image_result.stderr:
+                logger.error(f"Image stderr: {image_result.stderr[:1000]}")
+            
             if image_result.returncode == 0:
+                # List files in output directory
+                image_files = os.listdir(images_dir)
+                logger.info(f"Files in images directory: {image_files}")
+                
                 # Read image metadata
                 image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
                 if os.path.exists(image_metadata_path):
                     with open(image_metadata_path, 'r') as f:
                         image_metadata = json.load(f)
+                    
+                    logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata")
                     
                     for img_info in image_metadata.get('images', []):
                         # Format exactly as the original Python script
@@ -414,14 +446,18 @@ async def extract_all(
                         }
                         
                         all_results.append(result_item)
+                else:
+                    logger.warning("No image metadata file found")
                         
         except subprocess.TimeoutExpired:
             logger.error("Image extraction timed out")
         except Exception as e:
-            logger.error(f"Image extraction error: {e}")
+            logger.error(f"Image extraction error: {e}", exc_info=True)
         
         # Sort results by page and index (like the original script)
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
+        
+        logger.info(f"Total results: {len(all_results)} items")
         
         # Return the results array directly (matching the original stdout format)
         return JSONResponse(content=all_results)
