@@ -424,7 +424,20 @@ async def extract_all(
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
         
         # Return the results array directly (matching the original stdout format)
-        return JSONResponse(content=all_results)@app.get("/debug/check-environment")
+        return JSONResponse(content=all_results)
+        
+    except Exception as e:
+        logger.error(f"Extraction error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction error: {str(e)}"
+        )
+    finally:
+        # Cleanup
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+@app.get("/debug/check-environment")
 async def check_environment():
     """Check if Python environment is set up correctly"""
     checks = {
@@ -487,17 +500,6 @@ async def check_environment():
         checks["test_import"] = {"error": str(e)}
     
     return checks
-        
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
 @app.get("/test")
 async def test_endpoint():
@@ -507,8 +509,6 @@ async def test_endpoint():
         "timestamp": datetime.now().isoformat(),
         "python_version": sys.version
     }
-
-
 
 if __name__ == "__main__":
     import uvicorn
