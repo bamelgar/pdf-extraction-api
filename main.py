@@ -459,14 +459,14 @@ async def extract_all(
         
         logger.info(f"Total results: {len(all_results)} items")
         
-        # Return the results array directly (matching the original stdout format)
-        # Force it to always be an array by wrapping in a response object
+        # CRITICAL FIX: Return wrapped response to prevent n8n from unwrapping single-item arrays
         return {
-          "results": all_results,
-          "count": len(all_results),
-          "extraction_timestamp": datetime.now().isoformat()
+            "results": all_results,
+            "count": len(all_results),
+            "extraction_timestamp": datetime.now().isoformat(),
+            "success": True
         }
-    
+        
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}", exc_info=True)
         raise HTTPException(
