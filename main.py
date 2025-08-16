@@ -159,10 +159,10 @@ async def extract_images(
         output_dir = os.path.join(temp_dir, "images")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Run the extraction script
+        # Run the extraction script - CORRECTED FILENAME
         cmd = [
             sys.executable,
-            "enterprise_image_extractor_unique_ids.py",
+            "enterprise_image_extractor.py",  # FIXED: Changed from enterprise_image_extractor_unique_ids.py
             pdf_path,
             "--output-dir", output_dir
         ]
@@ -178,8 +178,8 @@ async def extract_images(
             logger.error(f"Image extraction failed: {result.stderr}")
             raise HTTPException(status_code=500, detail=f"Image extraction failed: {result.stderr}")
         
-        # Load metadata
-        metadata_path = os.path.join(output_dir, "image_extraction_metadata.json")
+        # Load metadata - CORRECTED FILENAME
+        metadata_path = os.path.join(output_dir, "extraction_metadata.json")  # FIXED: Changed from image_extraction_metadata.json
         if not os.path.exists(metadata_path):
             raise HTTPException(status_code=500, detail="No metadata file generated")
         
@@ -258,10 +258,10 @@ async def extract_all(
         if table_result.returncode != 0:
             logger.error(f"Table extraction failed: {table_result.stderr}")
         
-        # Run image extraction
+        # Run image extraction - CORRECTED FILENAME
         image_cmd = [
             sys.executable,
-            "enterprise_image_extractor_unique_ids.py",
+            "enterprise_image_extractor.py",  # FIXED: Changed from enterprise_image_extractor_unique_ids.py
             pdf_path,
             "--output-dir", images_dir
         ]
@@ -283,9 +283,9 @@ async def extract_all(
             with open(table_metadata_path, 'r') as f:
                 table_metadata = json.load(f)
         
-        # Load image metadata
+        # Load image metadata - CORRECTED FILENAME
         image_metadata = {}
-        image_metadata_path = os.path.join(images_dir, "image_extraction_metadata.json")
+        image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")  # FIXED: Changed from image_extraction_metadata.json
         if os.path.exists(image_metadata_path):
             with open(image_metadata_path, 'r') as f:
                 image_metadata = json.load(f)
@@ -342,9 +342,9 @@ async def extract_all(
                 "width": image_info.get('width', 0),
                 "height": image_info.get('height', 0),
                 "format": image_info.get('format', 'png'),
-                "size_bytes": image_info.get('size_bytes', 0),
-                "unique_id": image_info.get('unique_id', ''),
-                "metadata": image_info.get('metadata', {}),
+                "size_bytes": image_info.get('file_size', 0),  # FIXED: Changed from size_bytes to file_size
+                "unique_id": image_info.get('filename', ''),  # Use filename as unique_id
+                "metadata": image_info.get('visual_elements', {}),  # FIXED: Changed from metadata to visual_elements
                 "mimeType": f"image/{image_info.get('format', 'png')}"
             }
             
@@ -369,12 +369,12 @@ async def extract_all(
                 "tables": len(table_metadata.get('tables', [])),
                 "images": len(image_metadata.get('images', [])),
                 "total_pages": max(
-                    table_metadata.get('total_pages', 0),
-                    image_metadata.get('total_pages', 0)
+                    table_metadata.get('statistics', {}).get('total_pages', 0),
+                    image_metadata.get('statistics', {}).get('total_pages', 0)
                 ),
                 "extraction_time": {
-                    "tables": table_metadata.get('execution_time', 0),
-                    "images": image_metadata.get('execution_time', 0)
+                    "tables": table_metadata.get('statistics', {}).get('total_extraction_time', 0),
+                    "images": image_metadata.get('statistics', {}).get('total_extraction_time', 0)
                 }
             }
         }
@@ -405,7 +405,7 @@ async def debug_environment(token: str = Depends(verify_token)):
     # Check if scripts exist
     scripts = [
         "enterprise_table_extractor_full.py",
-        "enterprise_image_extractor_unique_ids.py"
+        "enterprise_image_extractor.py"  # FIXED: Changed from enterprise_image_extractor_unique_ids.py
     ]
     
     for script in scripts:
