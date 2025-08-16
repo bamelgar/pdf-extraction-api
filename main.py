@@ -1,629 +1,234 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import os
 import tempfile
-import shutil
-import json
-import base64
-from typing import List, Dict, Optional
 import subprocess
-import sys
-from datetime import datetime
+import json
+import shutil
+import base64
+from pathlib import Path
+from typing import List, Dict, Any
 import logging
-import multiprocessing as mp  # ADDED FOR PERFORMANCE
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 
-# Setup logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ADDED: Detect available CPUs for optimal worker count
-AVAILABLE_CPUS = mp.cpu_count()
-logger.info(f"System has {AVAILABLE_CPUS} CPUs available")
-
-# Create FastAPI app
 app = FastAPI(title="PDF Extraction API", version="1.0.0")
 
-# Add CORS middleware for n8n
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Simple auth
-security = HTTPBearer()
-API_KEY = os.environ.get("API_KEY", "your-secret-api-key-change-this")
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return credentials.credentials
+# Log system info
+cpu_count = os.cpu_count()
+logger.info(f"System has {cpu_count} CPUs available")
 
 @app.get("/")
-async def health_check():
-    return {
-        "status": "healthy",
-        "service": "PDF Extraction API",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "available_cpus": AVAILABLE_CPUS  # ADDED
-    }
+async def root():
+    return {"message": "PDF Extraction API", "status": "running"}
 
-@app.post("/extract/test")
-async def test_extraction(
-    file: UploadFile = File(...),
-    token: str = Depends(verify_token)
-):
-    """Test endpoint to verify file upload works"""
-    return {
-        "success": True,
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "message": "File received successfully"
-    }
-
-@app.post("/extract/tables")
-async def extract_tables(
-    file: UploadFile = File(...),
-    min_quality: float = 0.3,
-    workers: int = None,  # CHANGED: Auto-detect if not specified
-    token: str = Depends(verify_token)
-):
-    """Extract tables from PDF using the enterprise extractor"""
-    # ADDED: Optimize worker count
-    if workers is None:
-        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
-    logger.info(f"Using {workers} workers for table extraction")
-    
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        # Save uploaded file
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        
-        # Create output directory
-        output_dir = os.path.join(temp_dir, "tables")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Run the extraction script
-        cmd = [
-            sys.executable,
-            "enterprise_table_extractor_full.py",
-            pdf_path,
-            "--output-dir", output_dir,
-            "--workers", str(workers),
-            "--min-quality", str(min_quality),
-            "--clear-output"
-        ]
-        
-        logger.info(f"Running command: {' '.join(cmd)}")
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Extraction failed: {result.stderr}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Extraction failed: {result.stderr}"
-            )
-        
-        # Read the metadata file
-        metadata_path = os.path.join(output_dir, "extraction_metadata.json")
-        if not os.path.exists(metadata_path):
-            raise HTTPException(
-                status_code=500,
-                detail="No metadata file generated"
-            )
-        
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        
-        # Process each table
-        tables = []
-        for table_info in metadata.get('tables', []):
-            csv_path = os.path.join(output_dir, table_info['filename'])
-            
-            if os.path.exists(csv_path):
-                # Read CSV content
-                with open(csv_path, 'r', encoding='utf-8') as f:
-                    csv_content = f.read()
-                
-                # Read as base64
-                with open(csv_path, 'rb') as f:
-                    csv_base64 = base64.b64encode(f.read()).decode('utf-8')
-                
-                tables.append({
-                    'filename': table_info['filename'],
-                    'page_number': table_info['page_number'],
-                    'table_index': table_info['table_index'],
-                    'table_type': table_info['table_type'],
-                    'quality_score': table_info['quality_score'],
-                    'rows': table_info['rows'],
-                    'columns': table_info['columns'],
-                    'csv_content': csv_content,
-                    'csv_base64': csv_base64,
-                    'metadata': table_info.get('metadata', {})
-                })
-        
-        return {
-            'success': True,
-            'tables_count': len(tables),
-            'tables': tables,
-            'statistics': metadata.get('statistics', {})
-        }
-        
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail="Extraction timed out after 5 minutes"
-        )
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-@app.post("/extract/images")
-async def extract_images(
-    file: UploadFile = File(...),
-    min_quality: float = 0.3,
-    min_width: int = 100,
-    min_height: int = 100,
-    workers: int = None,  # CHANGED: Auto-detect if not specified
-    token: str = Depends(verify_token)
-):
-    """Extract images from PDF using the enterprise extractor"""
-    # ADDED: Optimize worker count
-    if workers is None:
-        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
-    logger.info(f"Using {workers} workers for image extraction")
-    
-    temp_dir = tempfile.mkdtemp()
-    
-    try:
-        # Save uploaded file
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        
-        # Create output directory
-        output_dir = os.path.join(temp_dir, "images")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Run the extraction script
-        cmd = [
-            sys.executable,
-            "enterprise_image_extractor.py",
-            pdf_path,
-            "--output-dir", output_dir,
-            "--workers", str(workers),
-            "--min-quality", str(min_quality),
-            "--min-width", str(min_width),
-            "--min-height", str(min_height),
-            "--clear-output"
-        ]
-        
-        logger.info(f"Running command: {' '.join(cmd)}")
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Extraction failed: {result.stderr}")
-            # Don't fail completely, log the error
-            logger.warning("Continuing despite extraction errors")
-        
-        # Read the metadata file if it exists
-        metadata_path = os.path.join(output_dir, "extraction_metadata.json")
-        metadata = {}
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-        
-        # Process each image
-        images = []
-        image_files = [f for f in os.listdir(output_dir) if f.endswith('.png')]
-        
-        for img_file in image_files:
-            img_path = os.path.join(output_dir, img_file)
-            
-            # Read image as base64
-            with open(img_path, 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
-            
-            # Find metadata for this image
-            img_metadata = {}
-            for img_info in metadata.get('images', []):
-                if img_info.get('filename') == img_file:
-                    img_metadata = img_info
-                    break
-            
-            images.append({
-                'filename': img_file,
-                'page_number': img_metadata.get('page_number', 0),
-                'image_index': img_metadata.get('image_index', 0),
-                'image_type': img_metadata.get('image_type', 'unknown'),
-                'quality_score': img_metadata.get('quality_score', 0.5),
-                'width': img_metadata.get('width', 0),
-                'height': img_metadata.get('height', 0),
-                'has_text': img_metadata.get('has_text', False),
-                'text_content': img_metadata.get('text_content', ''),
-                'image_base64': img_base64,
-                'metadata': img_metadata
-            })
-        
-        return {
-            'success': True,
-            'images_count': len(images),
-            'images': images,
-            'statistics': metadata.get('statistics', {})
-        }
-        
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail="Extraction timed out after 5 minutes"
-        )
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "cpus": os.cpu_count()}
 
 @app.post("/extract/all")
 async def extract_all(
     file: UploadFile = File(...),
-    min_quality: float = 0.3,
-    workers: int = None,  # CHANGED: Auto-detect if not specified
-    min_width: int = 100,
-    min_height: int = 100,
-    page_limit: int = None,  # ADDED: Optional page limit for testing
-    skip_ocr: bool = False,  # ADDED: Optional OCR skip for speed
-    token: str = Depends(verify_token)
+    min_quality: float = Form(0.3),
+    workers: int = Form(4),
+    page_limit: int = Form(None),  # ADD: Page limit support
+    skip_ocr: bool = Form(False)
 ):
-    """Extract both tables and images from PDF - mimics the original orchestrator script"""
-    # ADDED: Optimize worker count
-    if workers is None:
-        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
-    logger.info(f"Using {workers} workers for extraction (CPUs available: {AVAILABLE_CPUS})")
+    """Extract both tables and images from PDF"""
     
-    temp_dir = tempfile.mkdtemp()
+    # Use 16 workers if available (CHANGE: from 4 to 16)
+    max_workers = min(16, os.cpu_count() or 1)
+    actual_workers = min(workers, max_workers)
+    logger.info(f"Using {actual_workers} workers for extraction (CPUs available: {cpu_count})")
     
+    temp_dir = None
     try:
+        # Create temporary directory
+        temp_dir = tempfile.mkdtemp()
+        temp_path = Path(temp_dir)
+        
         # Save uploaded file
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+        pdf_path = temp_path / "input.pdf"
+        with open(pdf_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
         
-        # Log file details
-        file_size = os.path.getsize(pdf_path)
-        logger.info(f"Processing PDF: {file.filename}, Size: {file_size} bytes, Temp path: {pdf_path}")
+        logger.info(f"Processing PDF: {file.filename}, Size: {len(content)} bytes, Temp path: {pdf_path}")
         
-        # Create output directories
-        tables_dir = os.path.join(temp_dir, "pdf_tables")
-        images_dir = os.path.join(temp_dir, "pdf_images")
-        os.makedirs(tables_dir, exist_ok=True)
-        os.makedirs(images_dir, exist_ok=True)
-        
-        all_results = []
+        # Prepare directories
+        tables_dir = temp_path / "pdf_tables"
+        images_dir = temp_path / "pdf_images"
         
         # Extract tables
         logger.info("Extracting tables...")
         table_cmd = [
-            sys.executable,
+            "/usr/local/bin/python3.11",
             "enterprise_table_extractor_full.py",
-            pdf_path,
-            "--output-dir", tables_dir,
-            "--workers", str(workers),
+            str(pdf_path),
+            "--output-dir", str(tables_dir),
+            "--workers", str(actual_workers),
             "--min-quality", str(min_quality),
             "--clear-output"
         ]
         
-        # ADDED: Page limit for testing
+        # ADD: Page limit support for tables
         if page_limit:
             table_cmd.extend(["--page-limit", str(page_limit)])
         
-        # ADDED: Skip OCR for speed
-        if skip_ocr:
-            table_cmd.append("--skip-ocr")
-        
         logger.info(f"Running command: {' '.join(table_cmd)}")
         
-        try:
-            # CHANGED: Increased timeout for larger PDFs
-            timeout = 600 if not page_limit else 300
-            table_result = subprocess.run(
-                table_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            
-            logger.info(f"Table extraction exit code: {table_result.returncode}")
-            logger.info(f"Table stdout (first 500 chars): {table_result.stdout[:500]}")
-            if table_result.stderr:
-                logger.error(f"Table stderr: {table_result.stderr[:1000]}")
-            
-            if table_result.returncode == 0:
-                # List files in output directory
-                table_files = os.listdir(tables_dir)
-                logger.info(f"Files in tables directory: {table_files}")
-                
-                # Read table metadata
-                table_metadata_path = os.path.join(tables_dir, "extraction_metadata.json")
-                if os.path.exists(table_metadata_path):
-                    with open(table_metadata_path, 'r') as f:
-                        table_metadata = json.load(f)
-                    
-                    logger.info(f"Found {len(table_metadata.get('tables', []))} tables in metadata")
-                    
-                    for table_info in table_metadata.get('tables', []):
-                        # Build the result item
-                        result_item = {
-                            "type": "table",
-                            "page": table_info['page_number'],
-                            "index": table_info['table_index'],
-                            "filePath": f"/data/pdf_tables/{table_info['filename']}",
-                            "fileName": table_info['filename'],
-                            "table_type": table_info.get('table_type', 'general_data'),
-                            "quality_score": table_info.get('quality_score', 0.0),
-                            "extraction_method": table_info.get('extraction_method', 'unknown'),
-                            "rows": table_info.get('rows', 0),
-                            "columns": table_info.get('columns', 0),
-                            "size_bytes": table_info.get('size_bytes', 0),
-                            "has_headers": table_info.get('has_headers', True),
-                            "numeric_percentage": table_info.get('numeric_percentage', 0),
-                            "empty_cell_percentage": table_info.get('empty_cell_percentage', 0),
-                            "metadata": table_info.get('metadata', {}),
-                            "mimeType": "text/csv"
-                        }
-                        
-                        # ADD CSV CONTENT READING HERE
-                        csv_path = os.path.join(tables_dir, table_info['filename'])
-                        if os.path.exists(csv_path):
-                            try:
-                                with open(csv_path, 'r', encoding='utf-8') as f:
-                                    result_item["csv_content"] = f.read()
-                                logger.info(f"Read CSV content for {table_info['filename']}, length: {len(result_item['csv_content'])}")
-                            except Exception as e:
-                                logger.error(f"Error reading CSV {csv_path}: {e}")
-                                result_item["csv_content"] = ""
-                        else:
-                            logger.warning(f"CSV file not found: {csv_path}")
-                            result_item["csv_content"] = ""
-                        
-                        all_results.append(result_item)
-                else:
-                    logger.warning("No table metadata file found")
-                        
-        except subprocess.TimeoutExpired:
-            logger.error("Table extraction timed out")
-        except Exception as e:
-            logger.error(f"Table extraction error: {e}", exc_info=True)
-        
-        # Extract images
-        logger.info("Extracting images...")
-        image_cmd = [
-            sys.executable,
-            "enterprise_image_extractor.py",
-            pdf_path,
-            "--output-dir", images_dir,
-            "--workers", str(workers),
-            "--min-width", str(min_width),
-            "--min-height", str(min_height),
-            "--min-quality", str(min_quality),
-            "--vector-threshold", "10",
-            "--clear-output"
-        ]
-        
-        # ADDED: Page limit for testing
-        if page_limit:
-            image_cmd.extend(["--page-limit", str(page_limit)])
-        
-        logger.info(f"Running command: {' '.join(image_cmd)}")
-        
-        try:
-            # CHANGED: Increased timeout for larger PDFs
-            timeout = 600 if not page_limit else 300
-            image_result = subprocess.run(
-                image_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            
-            logger.info(f"Image extraction exit code: {image_result.returncode}")
-            logger.info(f"Image stdout (first 500 chars): {image_result.stdout[:500]}")
-            if image_result.stderr:
-                logger.error(f"Image stderr: {image_result.stderr[:1000]}")
-            
-            if image_result.returncode == 0:
-                # List files in output directory
-                image_files = os.listdir(images_dir)
-                logger.info(f"Files in images directory: {image_files}")
-                
-                # Read image metadata
-                image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
-                if os.path.exists(image_metadata_path):
-                    with open(image_metadata_path, 'r') as f:
-                        image_metadata = json.load(f)
-                    
-                    logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata")
-                    
-                    for img_info in image_metadata.get('images', []):
-                        # Format exactly as the original Python script
-                        result_item = {
-                            "type": "image",
-                            "page": img_info['page_number'],
-                            "index": img_info['image_index'],
-                            "filePath": f"/data/pdf_images/{img_info['filename']}",
-                            "fileName": img_info['filename'],
-                            "image_type": img_info.get('image_type', 'general_image'),
-                            "extraction_method": img_info.get('extraction_method', 'unknown'),
-                            "quality_score": img_info.get('quality_score', 0.0),
-                            "width": img_info.get('width', 0),
-                            "height": img_info.get('height', 0),
-                            "has_text": img_info.get('has_text', False),
-                            "text_content": img_info.get('text_content', ''),
-                            "caption": img_info.get('context', {}).get('caption'),
-                            "figure_reference": img_info.get('context', {}).get('figure_reference'),
-                            "visual_elements": img_info.get('visual_elements', {}),
-                            "vector_count": img_info.get('vector_count'),
-                            "enhancement_applied": img_info.get('enhancement_applied', False),
-                            "mimeType": "image/png"
-                        }
-                        
-                        # ADD BASE64 IMAGE CONTENT
-                        img_path = os.path.join(images_dir, img_info['filename'])
-                        if os.path.exists(img_path):
-                            try:
-                                with open(img_path, 'rb') as f:
-                                    img_base64 = base64.b64encode(f.read()).decode('utf-8')
-                                result_item["base64_content"] = img_base64
-                                logger.info(f"Added base64 for {img_info['filename']}, size: {len(img_base64)} chars")
-                            except Exception as e:
-                                logger.warning(f"Could not read image {img_info['filename']}: {e}")
-                                result_item["base64_content"] = None
-                        else:
-                            logger.warning(f"Image file not found: {img_path}")
-                            result_item["base64_content"] = None
-                        
-                        all_results.append(result_item)
-                else:
-                    logger.warning("No image metadata file found")
-                        
-        except subprocess.TimeoutExpired:
-            logger.error("Image extraction timed out")
-        except Exception as e:
-            logger.error(f"Image extraction error: {e}", exc_info=True)
-        
-        # Sort results by page and index (like the original script)
-        all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
-        
-        logger.info(f"Total results: {len(all_results)} items")
-        
-        # CRITICAL FIX: Return wrapped response to prevent n8n from unwrapping single-item arrays
-        return {
-            "results": all_results,
-            "count": len(all_results),
-            "extraction_timestamp": datetime.now().isoformat(),
-            "success": True,
-            "workers_used": workers,  # ADDED
-            "page_limit": page_limit,  # ADDED
-            "skip_ocr": skip_ocr  # ADDED
-        }
-        
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-@app.get("/debug/check-environment")
-async def check_environment():
-    """Check if Python environment is set up correctly"""
-    checks = {
-        "python_version": sys.version,
-        "current_directory": os.getcwd(),
-        "available_cpus": AVAILABLE_CPUS,  # ADDED
-        "scripts_exist": {
-            "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
-            "image_extractor": os.path.exists("enterprise_image_extractor.py")
-        },
-        "installed_packages": []
-    }
-    
-    # Check for required packages
-    required_packages = [
-        "pdfplumber", "pandas", "numpy", "camelot-py", 
-        "tabula-py", "PyMuPDF", "PIL", "cv2", "pytesseract"
-    ]
-    
-    for package in required_packages:
-        try:
-            if package == "PyMuPDF":
-                __import__("fitz")
-            elif package == "PIL":
-                __import__("PIL.Image")
-            elif package == "cv2":
-                __import__("cv2")
-            elif package == "camelot-py":
-                __import__("camelot")
-            elif package == "tabula-py":
-                __import__("tabula")
-            else:
-                __import__(package)
-            checks["installed_packages"].append({"package": package, "installed": True})
-        except ImportError:
-            checks["installed_packages"].append({"package": package, "installed": False})
-    
-    # Check for system dependencies
-    checks["system_checks"] = {
-        "java_available": shutil.which("java") is not None,
-        "tesseract_available": shutil.which("tesseract") is not None
-    }
-    
-    # List files in current directory
-    checks["files_in_directory"] = os.listdir(".")
-    
-    # Test simple extraction
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", "import pdfplumber; print('pdfplumber works')"],
+        # CHANGE: Increase timeout for large PDFs (from 600 to 1800 seconds)
+        table_result = subprocess.run(
+            table_cmd,
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=1800  # 30 minutes for table extraction
         )
-        checks["test_import"] = {
-            "success": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr
-        }
-    except Exception as e:
-        checks["test_import"] = {"error": str(e)}
+        
+        tables_extracted = []
+        if table_result.returncode == 0:
+            logger.info("Table extraction completed successfully")
+            if tables_dir.exists():
+                # Load table metadata
+                metadata_file = tables_dir / "extraction_metadata.json"
+                if metadata_file.exists():
+                    with open(metadata_file, 'r') as f:
+                        table_metadata = json.load(f)
+                        tables_extracted = table_metadata.get('tables', [])
+        else:
+            logger.error("Table extraction failed")
+            logger.error(f"Table stderr: {table_result.stderr}")
     
-    return checks
-
-@app.get("/test")
-async def test_endpoint():
-    """Simple test endpoint that doesn't require auth"""
-    return {
-        "message": "API is working!",
-        "timestamp": datetime.now().isoformat(),
-        "python_version": sys.version,
-        "available_cpus": AVAILABLE_CPUS  # ADDED
-    }
+    except subprocess.TimeoutExpired:
+        logger.error("Table extraction timed out")
+    except Exception as e:
+        logger.error(f"Table extraction error: {e}")
+    
+    # Extract images
+    logger.info("Extracting images...")
+    image_cmd = [
+        "/usr/local/bin/python3.11",
+        "enterprise_image_extractor.py",
+        str(pdf_path),
+        "--output-dir", str(images_dir),
+        "--workers", str(actual_workers),
+        "--min-width", "100",
+        "--min-height", "100",
+        "--min-quality", str(min_quality),
+        "--vector-threshold", "10",
+        "--clear-output"
+    ]
+    
+    # ADD: Page limit support for images
+    if page_limit:
+        image_cmd.extend(["--page-limit", str(page_limit)])
+    
+    if skip_ocr:
+        image_cmd.append("--no-ocr")
+    
+    logger.info(f"Running command: {' '.join(image_cmd)}")
+    
+    images_extracted = []
+    try:
+        # CHANGE: Increase timeout for images (from 600 to 900 seconds)
+        image_result = subprocess.run(
+            image_cmd,
+            capture_output=True,
+            text=True,
+            timeout=900  # 15 minutes for image extraction
+        )
+        
+        logger.info(f"Image extraction exit code: {image_result.returncode}")
+        logger.info(f"Image stdout (first 500 chars): {image_result.stdout[:500]}")
+        
+        if image_result.returncode != 0:
+            logger.error(f"Image stderr: {image_result.stderr}")
+        
+        if images_dir.exists():
+            # Get list of image files
+            image_files = list(images_dir.glob("*.png"))
+            logger.info(f"Files in images directory: {[f.name for f in image_files]}")
+            
+            # Load image metadata
+            metadata_file = images_dir / "extraction_metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    image_metadata = json.load(f)
+                    images_list = image_metadata.get('images', [])
+                    logger.info(f"Found {len(images_list)} images in metadata")
+                    
+                    # Add base64 data to each image
+                    for img_meta in images_list:
+                        img_file = images_dir / img_meta['filename']
+                        if img_file.exists():
+                            with open(img_file, 'rb') as f:
+                                img_data = f.read()
+                                img_base64 = base64.b64encode(img_data).decode('utf-8')
+                                img_meta['image_base64'] = img_base64
+                                logger.info(f"Added base64 for {img_meta['filename']}, size: {len(img_base64)} chars")
+                    
+                    images_extracted = images_list
+    
+    except subprocess.TimeoutExpired:
+        logger.error("Image extraction timed out")
+    except Exception as e:
+        logger.error(f"Image extraction error: {e}")
+    
+    # Combine results
+    all_results = []
+    
+    # Add tables
+    for table in tables_extracted:
+        result_item = {
+            "type": "table",
+            "page": table.get("page_number"),
+            "index": table.get("table_index"),
+            "extraction_method": table.get("extraction_method"),
+            "quality_score": table.get("quality_score"),
+            "table_type": table.get("table_type"),
+            "rows": table.get("rows"),
+            "columns": table.get("columns"),
+            "filename": table.get("filename"),
+            "metadata": table
+        }
+        all_results.append(result_item)
+    
+    # Add images
+    for image in images_extracted:
+        result_item = {
+            "type": "image",
+            "page": image.get("page_number"),
+            "index": image.get("image_index"),
+            "extraction_method": image.get("extraction_method"),
+            "image_type": image.get("image_type"),
+            "quality_score": image.get("quality_score"),
+            "width": image.get("width"),
+            "height": image.get("height"),
+            "filename": image.get("filename"),
+            "image_base64": image.get("image_base64"),
+            "metadata": image
+        }
+        all_results.append(result_item)
+    
+    logger.info(f"Total results: {len(all_results)} items")
+    
+    # Cleanup
+    if temp_dir and os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    
+    return [{
+        "results": all_results,
+        "count": len(all_results),
+        "extraction_timestamp": subprocess.run(["date", "-Iseconds"], capture_output=True, text=True).stdout.strip(),
+        "success": True,
+        "workers_used": actual_workers,
+        "page_limit": page_limit,  # ADD: Include page limit in response
+        "skip_ocr": skip_ocr
+    }]
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
