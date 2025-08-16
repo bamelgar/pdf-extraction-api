@@ -370,7 +370,19 @@ async def extract_all(
                             "mimeType": "text/csv"
                         }
                         
-                        # DO NOT ADD CSV CONTENT HERE - CSV content should be read separately by downstream nodes when needed
+                        # ADD CSV CONTENT READING HERE
+                        csv_path = os.path.join(tables_dir, table_info['filename'])
+                        if os.path.exists(csv_path):
+                            try:
+                                with open(csv_path, 'r', encoding='utf-8') as f:
+                                    result_item["csv_content"] = f.read()
+                                logger.info(f"Read CSV content for {table_info['filename']}, length: {len(result_item['csv_content'])}")
+                            except Exception as e:
+                                logger.error(f"Error reading CSV {csv_path}: {e}")
+                                result_item["csv_content"] = ""
+                        else:
+                            logger.warning(f"CSV file not found: {csv_path}")
+                            result_item["csv_content"] = ""
                         
                         all_results.append(result_item)
                 else:
