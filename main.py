@@ -12,10 +12,15 @@ import subprocess
 import sys
 from datetime import datetime
 import logging
+import multiprocessing as mp  # ADDED FOR PERFORMANCE
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ADDED: Detect available CPUs for optimal worker count
+AVAILABLE_CPUS = mp.cpu_count()
+logger.info(f"System has {AVAILABLE_CPUS} CPUs available")
 
 # Create FastAPI app
 app = FastAPI(title="PDF Extraction API", version="1.0.0")
@@ -44,7 +49,8 @@ async def health_check():
         "status": "healthy",
         "service": "PDF Extraction API",
         "version": "1.0.0",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "available_cpus": AVAILABLE_CPUS  # ADDED
     }
 
 @app.post("/extract/test")
@@ -64,10 +70,15 @@ async def test_extraction(
 async def extract_tables(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = None,  # CHANGED: Auto-detect if not specified
     token: str = Depends(verify_token)
 ):
     """Extract tables from PDF using the enterprise extractor"""
+    # ADDED: Optimize worker count
+    if workers is None:
+        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
+    logger.info(f"Using {workers} workers for table extraction")
+    
     temp_dir = tempfile.mkdtemp()
     
     try:
@@ -174,10 +185,15 @@ async def extract_images(
     min_quality: float = 0.3,
     min_width: int = 100,
     min_height: int = 100,
-    workers: int = 4,
+    workers: int = None,  # CHANGED: Auto-detect if not specified
     token: str = Depends(verify_token)
 ):
     """Extract images from PDF using the enterprise extractor"""
+    # ADDED: Optimize worker count
+    if workers is None:
+        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
+    logger.info(f"Using {workers} workers for image extraction")
+    
     temp_dir = tempfile.mkdtemp()
     
     try:
@@ -283,12 +299,19 @@ async def extract_images(
 async def extract_all(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = None,  # CHANGED: Auto-detect if not specified
     min_width: int = 100,
     min_height: int = 100,
+    page_limit: int = None,  # ADDED: Optional page limit for testing
+    skip_ocr: bool = False,  # ADDED: Optional OCR skip for speed
     token: str = Depends(verify_token)
 ):
     """Extract both tables and images from PDF - mimics the original orchestrator script"""
+    # ADDED: Optimize worker count
+    if workers is None:
+        workers = min(AVAILABLE_CPUS, 16)  # Cap at 16 for stability
+    logger.info(f"Using {workers} workers for extraction (CPUs available: {AVAILABLE_CPUS})")
+    
     temp_dir = tempfile.mkdtemp()
     
     try:
@@ -321,14 +344,24 @@ async def extract_all(
             "--clear-output"
         ]
         
+        # ADDED: Page limit for testing
+        if page_limit:
+            table_cmd.extend(["--page-limit", str(page_limit)])
+        
+        # ADDED: Skip OCR for speed
+        if skip_ocr:
+            table_cmd.append("--skip-ocr")
+        
         logger.info(f"Running command: {' '.join(table_cmd)}")
         
         try:
+            # CHANGED: Increased timeout for larger PDFs
+            timeout = 600 if not page_limit else 300
             table_result = subprocess.run(
                 table_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=timeout
             )
             
             logger.info(f"Table extraction exit code: {table_result.returncode}")
@@ -408,14 +441,20 @@ async def extract_all(
             "--clear-output"
         ]
         
+        # ADDED: Page limit for testing
+        if page_limit:
+            image_cmd.extend(["--page-limit", str(page_limit)])
+        
         logger.info(f"Running command: {' '.join(image_cmd)}")
         
         try:
+            # CHANGED: Increased timeout for larger PDFs
+            timeout = 600 if not page_limit else 300
             image_result = subprocess.run(
                 image_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=timeout
             )
             
             logger.info(f"Image extraction exit code: {image_result.returncode}")
@@ -493,7 +532,10 @@ async def extract_all(
             "results": all_results,
             "count": len(all_results),
             "extraction_timestamp": datetime.now().isoformat(),
-            "success": True
+            "success": True,
+            "workers_used": workers,  # ADDED
+            "page_limit": page_limit,  # ADDED
+            "skip_ocr": skip_ocr  # ADDED
         }
         
     except Exception as e:
@@ -513,6 +555,7 @@ async def check_environment():
     checks = {
         "python_version": sys.version,
         "current_directory": os.getcwd(),
+        "available_cpus": AVAILABLE_CPUS,  # ADDED
         "scripts_exist": {
             "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
             "image_extractor": os.path.exists("enterprise_image_extractor.py")
@@ -577,7 +620,8 @@ async def test_endpoint():
     return {
         "message": "API is working!",
         "timestamp": datetime.now().isoformat(),
-        "python_version": sys.version
+        "python_version": sys.version,
+        "available_cpus": AVAILABLE_CPUS  # ADDED
     }
 
 if __name__ == "__main__":
