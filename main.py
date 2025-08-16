@@ -459,6 +459,21 @@ async def extract_all(
                             "mimeType": "image/png"
                         }
                         
+                        # ADD BASE64 IMAGE CONTENT
+                        img_path = os.path.join(images_dir, img_info['filename'])
+                        if os.path.exists(img_path):
+                            try:
+                                with open(img_path, 'rb') as f:
+                                    img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                                result_item["base64_content"] = img_base64
+                                logger.info(f"Added base64 for {img_info['filename']}, size: {len(img_base64)} chars")
+                            except Exception as e:
+                                logger.warning(f"Could not read image {img_info['filename']}: {e}")
+                                result_item["base64_content"] = None
+                        else:
+                            logger.warning(f"Image file not found: {img_path}")
+                            result_item["base64_content"] = None
+                        
                         all_results.append(result_item)
                 else:
                     logger.warning("No image metadata file found")
