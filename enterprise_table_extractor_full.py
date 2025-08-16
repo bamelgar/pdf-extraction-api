@@ -122,7 +122,7 @@ class TableClassifier:
             'scientific_data': {
                 'keywords': ['experiment', 'sample', 'control', 'mean', 'std', 'p-value', 
                            'significant', 'correlation', 'n=', 'error', 'ci', 'confidence'],
-                'patterns': [r'±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*±\s*\d+\.\d+', 
+                'patterns': [r'Â±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*Â±\s*\d+\.\d+', 
                            r'r\s*=\s*[0-9.-]+', r'n\s*=\s*\d+'],
                 'metadata_extractors': ['units', 'statistical_measures', 'sample_size', 'p_values']
             },
@@ -195,7 +195,7 @@ class TableClassifier:
         if 'statistical_measures' in config.get('metadata_extractors', []):
             text = str(table_data)
             metadata['has_p_values'] = bool(re.search(r'p\s*[<=]\s*0\.\d+', text))
-            metadata['has_error_bars'] = bool(re.search(r'±', text))
+            metadata['has_error_bars'] = bool(re.search(r'Â±', text))
             metadata['has_confidence_intervals'] = bool(re.search(r'(CI|confidence\s*interval)', text, re.I))
         
         if 'fiscal_period' in config.get('metadata_extractors', []):
@@ -210,7 +210,7 @@ class TableClassifier:
     def _detect_currency(table_data):
         """Detect currency in table"""
         currencies = {
-            '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', 'CHF': 'CHF',
+            '$': 'USD', 'â‚¬': 'EUR', 'Â£': 'GBP', 'Â¥': 'JPY', 'CHF': 'CHF',
             'Rs': 'INR', 'R$': 'BRL', 'C$': 'CAD', 'A$': 'AUD', 'HK$': 'HKD'
         }
         
@@ -227,8 +227,8 @@ class TableClassifier:
             # Financial
             r'million', r'billion', r'thousand', r'mn', r'bn', r'k',
             # Scientific
-            r'mg/ml', r'μg/ml', r'ng/ml', r'mM', r'μM', r'nM',
-            r'kDa', r'Da', r'°C', r'°F', r'K',
+            r'mg/ml', r'Î¼g/ml', r'ng/ml', r'mM', r'Î¼M', r'nM',
+            r'kDa', r'Da', r'Â°C', r'Â°F', r'K',
             # ESG
             r'tCO2e?', r'MWh', r'GWh', r'GJ', r'TJ',
             # General
@@ -411,7 +411,9 @@ class EnterpriseTableExtractor:
         # Configuration
         self.config = config or {}
         self.min_quality_score = self.config.get('min_quality_score', 0.3)
-        self.max_workers = self.config.get('max_workers', min(9, os.cpu_count() or 1))
+        # OPTIMIZED: Use all available CPUs up to 16 for Professional plan
+        self.max_workers = self.config.get('max_workers', min(16, os.cpu_count() or 1))
+        self.page_limit = self.config.get('page_limit', None)  # Add page limit support for testing
         self.save_metadata = self.config.get('save_metadata', True)
         self.enforce_quality_filter = self.config.get('enforce_quality_filter', False)
         self.enable_verification = self.config.get('enable_verification', True)
@@ -500,12 +502,18 @@ class EnterpriseTableExtractor:
         logger.info(f"Processing {self.extraction_stats['total_pages']} pages")
         logger.info(f"Quality filter: {'ENABLED' if self.enforce_quality_filter else 'DISABLED'}")
         
+        # Determine pages to process
+        total_pages = self.extraction_stats['total_pages']
+        if self.page_limit:
+            total_pages = min(self.page_limit, total_pages)
+            logger.info(f"Page limit set: processing first {total_pages} pages only")
+        
         # Process pages in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all pages
+            # Submit pages up to limit
             future_to_page = {
                 executor.submit(self._process_page_safe, page_num): page_num
-                for page_num in range(1, self.extraction_stats['total_pages'] + 1)
+                for page_num in range(1, total_pages + 1)
             }
             
             # Process results as they complete
@@ -515,9 +523,9 @@ class EnterpriseTableExtractor:
                 processed_pages += 1
                 
                 # Progress update
-                if processed_pages % 10 == 0 or processed_pages == self.extraction_stats['total_pages']:
-                    progress = (processed_pages / self.extraction_stats['total_pages']) * 100
-                    logger.info(f"Progress: {processed_pages}/{self.extraction_stats['total_pages']} pages ({progress:.1f}%)")
+                if processed_pages % 10 == 0 or processed_pages == total_pages:
+                    progress = (processed_pages / total_pages) * 100
+                    logger.info(f"Progress: {processed_pages}/{total_pages} pages ({progress:.1f}%)")
                 
                 try:
                     page_tables = future.result()
@@ -1021,7 +1029,8 @@ class EnterpriseTableExtractor:
                 'max_workers': self.max_workers,
                 'min_quality_score': self.min_quality_score,
                 'enforce_quality_filter': self.enforce_quality_filter,
-                'enable_verification': self.enable_verification
+                'enable_verification': self.enable_verification,
+                'page_limit': self.page_limit
             },
             'statistics': dict(self.extraction_stats),
             'tables': [asdict(table) for table in self.extracted_tables]
@@ -1077,12 +1086,18 @@ def main():
         action='store_true',
         help='Skip file verification step'
     )
+    parser.add_argument(
+        '--page-limit',
+        type=int,
+        default=None,
+        help='Limit extraction to first N pages (for testing)'
+    )
     
     args = parser.parse_args()
     
     # Auto-detect optimal workers
     if args.workers == 0:
-        args.workers = min(9, os.cpu_count() or 1)
+        args.workers = min(16, os.cpu_count() or 1)
         logger.info(f"Auto-detected {args.workers} workers")
     
     # Configuration
@@ -1091,7 +1106,8 @@ def main():
         'min_quality_score': args.min_quality,
         'save_metadata': True,
         'enforce_quality_filter': args.enforce_quality_filter,
-        'enable_verification': not args.no_verification
+        'enable_verification': not args.no_verification,
+        'page_limit': args.page_limit
     }
     
     # Clear output directory if requested
