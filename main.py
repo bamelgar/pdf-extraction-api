@@ -370,8 +370,7 @@ async def extract_all(
                             "mimeType": "text/csv"
                         }
                         
-                        # DO NOT ADD CSV CONTENT HERE - REMOVED THE PROBLEMATIC LINES
-                        # The CSV content should be read separately by downstream nodes when needed
+                        # DO NOT ADD CSV CONTENT HERE - CSV content should be read separately by downstream nodes when needed
                         
                         all_results.append(result_item)
                 else:
