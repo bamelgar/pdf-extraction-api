@@ -21,14 +21,23 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PDF Extraction API", version="1.0.0")
 
-# Supabase configuration
-SUPABASE_URL = "https://hdxxfknkzodgwzrcddug.supabase.co"
-SUPABASE_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhkeHhma25rem9kZ3d6cmNkZHVnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MTkyMDM0MiwiZXhwIjoyMDY3NDk2MzQyfQ.Oxj9cWTDm8hTo1zReh8JwPUnCMCSrAoRyyutON_iaNE"
-SUPABASE_BUCKET = "public-images"
+# Supabase configuration - using environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_TOKEN = os.environ.get("SUPABASE_TOKEN") 
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "public-images")
 
 def test_supabase_connection() -> Dict[str, Any]:
     """Test Supabase connection and storage access"""
     logger.info("Testing Supabase connection...")
+    
+    # Check if environment variables are set
+    if not SUPABASE_URL or not SUPABASE_TOKEN:
+        logger.error("❌ Supabase environment variables not set")
+        return {
+            "status": "error",
+            "error": "Missing SUPABASE_URL or SUPABASE_TOKEN environment variables",
+            "message": "Environment variables not configured"
+        }
     
     try:
         # Create a small test image
@@ -65,6 +74,7 @@ def test_supabase_connection() -> Dict[str, Any]:
                 "public_access": check_response.status_code == 200,
                 "test_filename": test_filename,
                 "bucket": SUPABASE_BUCKET,
+                "supabase_url": SUPABASE_URL,
                 "message": "Supabase storage is working correctly"
             }
         else:
@@ -74,6 +84,7 @@ def test_supabase_connection() -> Dict[str, Any]:
                 "upload_status": response.status_code,
                 "error": response.text,
                 "bucket": SUPABASE_BUCKET,
+                "supabase_url": SUPABASE_URL,
                 "message": "Failed to upload to Supabase"
             }
             
@@ -83,11 +94,18 @@ def test_supabase_connection() -> Dict[str, Any]:
             "status": "error",
             "error": str(e),
             "bucket": SUPABASE_BUCKET,
+            "supabase_url": SUPABASE_URL,
             "message": "Connection test failed"
         }
 
 def upload_image_to_supabase(image_path: Path, filename: str) -> str:
     """Upload image to Supabase Storage and return public URL"""
+    
+    # Check if environment variables are set
+    if not SUPABASE_URL or not SUPABASE_TOKEN:
+        logger.error("❌ Supabase environment variables not configured")
+        return None
+    
     try:
         # Read image data
         with open(image_path, 'rb') as f:
