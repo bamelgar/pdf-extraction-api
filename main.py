@@ -12,8 +12,6 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import requests
 from datetime import datetime
-from PIL import Image
-from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,89 +19,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PDF Extraction API", version="1.0.0")
 
-# Supabase configuration - using environment variables
+# Supabase configuration - using environment variables for security
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_TOKEN = os.environ.get("SUPABASE_TOKEN") 
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "public-images")
 
-def test_supabase_connection() -> Dict[str, Any]:
-    """Test Supabase connection and storage access"""
-    logger.info("Testing Supabase connection...")
-    
-    # Check if environment variables are set
-    if not SUPABASE_URL or not SUPABASE_TOKEN:
-        logger.error("❌ Supabase environment variables not set")
-        return {
-            "status": "error",
-            "error": "Missing SUPABASE_URL or SUPABASE_TOKEN environment variables",
-            "message": "Environment variables not configured"
-        }
-    
-    try:
-        # Create a small test image
-        test_image = Image.new('RGB', (10, 10), color='red')
-        img_buffer = BytesIO()
-        test_image.save(img_buffer, format='PNG')
-        test_data = img_buffer.getvalue()
-        
-        # Test filename
-        test_filename = f"test_connection_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        
-        # Test upload
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{test_filename}"
-        headers = {
-            "Authorization": f"Bearer {SUPABASE_TOKEN}",
-            "Content-Type": "image/png"
-        }
-        
-        response = requests.put(upload_url, data=test_data, headers=headers, timeout=10)
-        
-        if response.status_code in [200, 201]:
-            # Test public URL access
-            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{test_filename}"
-            check_response = requests.head(public_url, timeout=10)
-            
-            # Clean up test file
-            delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{test_filename}"
-            requests.delete(delete_url, headers={"Authorization": f"Bearer {SUPABASE_TOKEN}"})
-            
-            logger.info("✅ Supabase connection test successful")
-            return {
-                "status": "success",
-                "upload_status": response.status_code,
-                "public_access": check_response.status_code == 200,
-                "test_filename": test_filename,
-                "bucket": SUPABASE_BUCKET,
-                "supabase_url": SUPABASE_URL,
-                "message": "Supabase storage is working correctly"
-            }
-        else:
-            logger.error(f"❌ Supabase upload failed: {response.status_code} - {response.text}")
-            return {
-                "status": "error",
-                "upload_status": response.status_code,
-                "error": response.text,
-                "bucket": SUPABASE_BUCKET,
-                "supabase_url": SUPABASE_URL,
-                "message": "Failed to upload to Supabase"
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ Supabase connection test failed: {e}")
-        return {
-            "status": "error",
-            "error": str(e),
-            "bucket": SUPABASE_BUCKET,
-            "supabase_url": SUPABASE_URL,
-            "message": "Connection test failed"
-        }
-
 def upload_image_to_supabase(image_path: Path, filename: str) -> str:
     """Upload image to Supabase Storage and return public URL"""
-    
-    # Check if environment variables are set
     if not SUPABASE_URL or not SUPABASE_TOKEN:
-        logger.error("❌ Supabase environment variables not configured")
+        logger.warning("Supabase not configured - skipping upload")
         return None
     
     try:
@@ -121,19 +45,19 @@ def upload_image_to_supabase(image_path: Path, filename: str) -> str:
         }
         
         # Upload to Supabase
-        response = requests.put(upload_url, data=image_data, headers=headers)
+        response = requests.put(upload_url, data=image_data, headers=headers, timeout=30)
         
         if response.status_code in [200, 201]:
             # Return public URL
             public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
-            logger.info(f"Successfully uploaded {filename} to Supabase")
+            logger.info(f"✅ Uploaded {filename} to Supabase")
             return public_url
         else:
-            logger.error(f"Failed to upload {filename}: {response.status_code} - {response.text}")
+            logger.error(f"❌ Failed to upload {filename}: {response.status_code}")
             return None
             
     except Exception as e:
-        logger.error(f"Error uploading {filename} to Supabase: {e}")
+        logger.error(f"❌ Error uploading {filename}: {e}")
         return None
 
 # Log system info
@@ -148,54 +72,17 @@ async def root():
 async def health():
     return {"status": "healthy", "cpus": os.cpu_count()}
 
-@app.get("/test-supabase")
-async def test_supabase():
-    """Test Supabase connection and storage functionality"""
-    result = test_supabase_connection()
-    return result
-
-@app.get("/diagnostics")
-async def diagnostics():
-    """Comprehensive system diagnostics"""
-    logger.info("Running system diagnostics...")
-    
-    diagnostics_result = {
-        "system": {
-            "cpus": os.cpu_count(),
-            "python_version": subprocess.run(["python3", "--version"], capture_output=True, text=True).stdout.strip(),
-            "disk_space": subprocess.run(["df", "-h", "/tmp"], capture_output=True, text=True).stdout.strip()
-        },
-        "supabase": test_supabase_connection(),
-        "dependencies": {
-            "requests_available": True,
-            "pil_available": True
-        }
-    }
-    
-    # Test if extractor scripts exist
-    scripts = ["enterprise_table_extractor_full.py", "enterprise_image_extractor.py"]
-    diagnostics_result["scripts"] = {}
-    
-    for script in scripts:
-        script_exists = os.path.exists(script)
-        diagnostics_result["scripts"][script] = {
-            "exists": script_exists,
-            "executable": os.access(script, os.X_OK) if script_exists else False
-        }
-    
-    return diagnostics_result
-
 @app.post("/extract/all")
 async def extract_all(
     file: UploadFile = File(...),
     min_quality: float = Form(0.3),
     workers: int = Form(4),
-    page_limit: int = Form(None),  # ADD: Page limit support
+    page_limit: int = Form(None),
     skip_ocr: bool = Form(False)
 ):
     """Extract both tables and images from PDF"""
     
-    # Use 16 workers if available (CHANGE: from 4 to 16)
+    # Use 16 workers if available (EXACT same logic as your working version)
     max_workers = min(16, os.cpu_count() or 1)
     actual_workers = min(workers, max_workers)
     logger.info(f"Using {actual_workers} workers for extraction (CPUs available: {cpu_count})")
@@ -218,7 +105,7 @@ async def extract_all(
         tables_dir = temp_path / "pdf_tables"
         images_dir = temp_path / "pdf_images"
         
-        # Extract tables
+        # Extract tables (EXACT same logic as your working version)
         logger.info("Extracting tables...")
         table_cmd = [
             "/usr/local/bin/python3.11",
@@ -236,7 +123,7 @@ async def extract_all(
         
         logger.info(f"Running command: {' '.join(table_cmd)}")
         
-        # CHANGE: Increase timeout for large PDFs (from 600 to 1800 seconds)
+        # EXACT same timeout as your working version
         table_result = subprocess.run(
             table_cmd,
             capture_output=True,
@@ -258,7 +145,7 @@ async def extract_all(
             logger.error("Table extraction failed")
             logger.error(f"Table stderr: {table_result.stderr}")
     
-        # Extract images
+        # Extract images (EXACT same logic as your working version)
         logger.info("Extracting images...")
         image_cmd = [
             "/usr/local/bin/python3.11",
@@ -284,7 +171,7 @@ async def extract_all(
         
         images_extracted = []
         try:
-            # CHANGE: Increase timeout for images (from 600 to 900 seconds)
+            # EXACT same timeout as your working version
             image_result = subprocess.run(
                 image_cmd,
                 capture_output=True,
@@ -311,14 +198,7 @@ async def extract_all(
                         images_list = image_metadata.get('images', [])
                         logger.info(f"Found {len(images_list)} images in metadata")
                         
-                        # Upload images to Supabase instead of embedding base64
-                        supabase_stats = {
-                            "total_images": len(images_list),
-                            "successful_uploads": 0,
-                            "failed_uploads": 0,
-                            "upload_errors": []
-                        }
-                        
+                        # ONLY CHANGE: Upload to Supabase instead of base64
                         for img_meta in images_list:
                             img_file = images_dir / img_meta['filename']
                             if img_file.exists():
@@ -332,28 +212,22 @@ async def extract_all(
                                 if supabase_url:
                                     img_meta['supabase_url'] = supabase_url
                                     img_meta['uploaded_filename'] = unique_filename
-                                    supabase_stats["successful_uploads"] += 1
-                                    logger.info(f"✅ Uploaded {img_meta['filename']} to Supabase as {unique_filename}")
                                 else:
-                                    img_meta['supabase_url'] = None
-                                    img_meta['uploaded_filename'] = None
-                                    supabase_stats["failed_uploads"] += 1
-                                    supabase_stats["upload_errors"].append(img_meta['filename'])
-                                    logger.warning(f"❌ Failed to upload {img_meta['filename']} to Supabase")
-                        
-                        # Log Supabase upload statistics
-                        logger.info(f"📊 Supabase Upload Summary: {supabase_stats['successful_uploads']}/{supabase_stats['total_images']} successful")
-                        if supabase_stats["failed_uploads"] > 0:
-                            logger.warning(f"⚠️  Failed uploads: {supabase_stats['upload_errors']}")
+                                    # Fallback to base64 if Supabase fails
+                                    with open(img_file, 'rb') as f:
+                                        img_data = f.read()
+                                        img_base64 = base64.b64encode(img_data).decode('utf-8')
+                                        img_meta['image_base64'] = img_base64
+                                        logger.info(f"Fallback: Added base64 for {img_meta['filename']}")
                         
                         images_extracted = images_list
-        
+    
         except subprocess.TimeoutExpired:
             logger.error("Image extraction timed out")
         except Exception as e:
             logger.error(f"Image extraction error: {e}")
         
-        # Combine results
+        # Combine results (EXACT same logic as your working version)
         all_results = []
         
         # Add tables
@@ -384,10 +258,16 @@ async def extract_all(
                 "width": image.get("width"),
                 "height": image.get("height"),
                 "filename": image.get("filename"),
-                "supabase_url": image.get("supabase_url"),
-                "uploaded_filename": image.get("uploaded_filename"),
                 "metadata": image
             }
+            
+            # Add either Supabase URL or base64 (whichever worked)
+            if image.get('supabase_url'):
+                result_item['supabase_url'] = image.get('supabase_url')
+                result_item['uploaded_filename'] = image.get('uploaded_filename')
+            elif image.get('image_base64'):
+                result_item['image_base64'] = image.get('image_base64')
+            
             all_results.append(result_item)
         
         logger.info(f"Total results: {len(all_results)} items")
@@ -402,7 +282,7 @@ async def extract_all(
             "extraction_timestamp": subprocess.run(["date", "-Iseconds"], capture_output=True, text=True).stdout.strip(),
             "success": True,
             "workers_used": actual_workers,
-            "page_limit": page_limit,  # ADD: Include page limit in response
+            "page_limit": page_limit,
             "skip_ocr": skip_ocr
         }]
 
