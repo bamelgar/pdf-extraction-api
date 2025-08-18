@@ -20,7 +20,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 # App & Security
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="PDF Extraction API", version="1.0.0")
+app = FastAPI(title="PDF Extraction API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,10 +35,8 @@ logging.basicConfig(level=logging.INFO)
 bearer = HTTPBearer(auto_error=False)
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> str:
-    """Simple Bearer token check against API_KEY env var."""
     api_key = os.environ.get("API_KEY", "").strip()
     if not api_key:
-        # If no API key configured, allow open access (useful during bring-up)
         return ""
     if not credentials or not credentials.credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -54,16 +52,12 @@ REPO_DIR = Path(__file__).resolve().parent
 
 def _script_path(name: str) -> str:
     p = REPO_DIR / name
-    if not p.exists():
-        # allow calling without path (PYTHONPATH cwd)
-        return name
-    return str(p)
+    return str(p if p.exists() else name)
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 def resolve_workers(request: Request, form_workers: int) -> int:
-    """Honor both form and query param; cap by CPU and 16. Prefer the larger value."""
     try:
         qs = int(request.query_params.get("workers", form_workers))
     except Exception:
@@ -74,15 +68,32 @@ def resolve_workers(request: Request, form_workers: int) -> int:
     logger.info(f"Workers resolved -> form={form_workers}, query={qs}, cpus={os.cpu_count()}, using={actual}")
     return actual
 
+def resolve_page_limit(request: Request, form_limit: Optional[int]) -> Optional[int]:
+    """Honor both form and query; prefer the smaller positive (safer in cloud)."""
+    qval = request.query_params.get("page_limit")
+    qint = None
+    try:
+        if qval is not None:
+            qint = int(qval)
+    except Exception:
+        qint = None
+
+    candidates = [v for v in [form_limit, qint] if v and v > 0]
+    if not candidates:
+        logger.info("Page limit resolved -> none provided; processing all pages")
+        return None
+    # cap very high values defensively (no behavior change for typical tests)
+    using = max(1, min(min(candidates), 2000))
+    logger.info(f"Page limit resolved -> form={form_limit}, query={qint}, using={using}")
+    return using
+
 def supabase_public_url(bucket: str, object_name: str) -> Optional[str]:
     url = os.environ.get("SUPABASE_URL", "").rstrip("/")
     if not url:
         return None
-    # Public URL form works when the bucket has public access enabled
     return f"{url}/storage/v1/object/public/{bucket}/{object_name}"
 
 def upload_to_supabase(bucket: str, object_name: str, file_path: Path, content_type: str = "application/octet-stream") -> Optional[str]:
-    """Upload a file to Supabase Storage; returns public URL on success."""
     url = os.environ.get("SUPABASE_URL", "").rstrip("/")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY") or ""
     if not url or not key:
@@ -137,7 +148,6 @@ async def test_endpoint() -> Dict[str, Any]:
 
 @app.get("/debug/check-environment")
 async def debug_check_environment(_: str = Depends(verify_token)) -> Dict[str, Any]:
-    """Checks availability of system tools and versions for debugging."""
     checks: Dict[str, Any] = {"timestamp": _now_iso()}
     commands = {
         "python": [sys.executable, "--version"],
@@ -169,12 +179,9 @@ async def extract_tables(
     min_quality: float = Form(0.3),
     workers: int = Form(4),
     include_csv_base64: bool = Form(True),
+    page_limit: Optional[int] = Form(None),
     _: str = Depends(verify_token),
 ) -> JSONResponse:
-    """
-    Extract tables via enterprise_table_extractor_full.py.
-    Returns table metadata + csv_content and (optionally) csv_base64.
-    """
     temp_dir = tempfile.mkdtemp()
     temp_path = Path(temp_dir)
     try:
@@ -186,6 +193,8 @@ async def extract_tables(
         tables_dir.mkdir(parents=True, exist_ok=True)
 
         actual_workers = resolve_workers(request, workers)
+        actual_limit = resolve_page_limit(request, page_limit)
+
         cmd = [
             sys.executable,
             _script_path("enterprise_table_extractor_full.py"),
@@ -195,8 +204,10 @@ async def extract_tables(
             "--min-quality", str(min_quality),
             "--clear-output",
         ]
+        if actual_limit:
+            cmd.extend(["--page-limit", str(actual_limit)])
+
         logger.info("Running tables cmd: %s", " ".join(cmd))
-        # tables can be slower; allow longer than images
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=int(os.environ.get("TABLES_TIMEOUT_SEC", "1200")))
         if result.returncode != 0:
             logger.error("Tables extractor failed: %s", result.stderr)
@@ -260,15 +271,11 @@ async def extract_images(
     vector_threshold: int = Form(10),
     include_base64: bool = Form(False),
     skip_ocr: bool = Form(False),
+    page_limit: Optional[int] = Form(None),
     supabase_bucket: str = Form("public-images"),
     supabase_prefix: str = Form(""),
     _: str = Depends(verify_token),
 ) -> JSONResponse:
-    """
-    Extract images via enterprise_image_extractor.py.
-    Returns image metadata; includes base64 only if requested.
-    If Supabase is configured, uploads PNGs and includes public URLs.
-    """
     temp_dir = tempfile.mkdtemp()
     temp_path = Path(temp_dir)
     try:
@@ -280,6 +287,8 @@ async def extract_images(
         images_dir.mkdir(parents=True, exist_ok=True)
 
         actual_workers = resolve_workers(request, workers)
+        actual_limit = resolve_page_limit(request, page_limit)
+
         cmd = [
             sys.executable,
             _script_path("enterprise_image_extractor.py"),
@@ -292,8 +301,11 @@ async def extract_images(
             "--vector-threshold", str(vector_threshold),
             "--clear-output",
         ]
+        if actual_limit:
+            cmd.extend(["--page-limit", str(actual_limit)])
         if skip_ocr:
-            cmd.append("--skip-ocr")
+            cmd.append("--no-ocr")  # v2 flag
+
         logger.info("Running images cmd: %s", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=int(os.environ.get("IMAGES_TIMEOUT_SEC", "900")))
         if result.returncode != 0:
@@ -321,10 +333,8 @@ async def extract_images(
                 "height": im.get("height"),
                 "metadata": im.get("metadata", {}),
             }
-            # Upload to Supabase if configured
             if img_path and img_path.exists():
                 if os.environ.get("SUPABASE_URL") and (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")):
-                    # Construct object path (optional prefix)
                     object_name = f"{supabase_prefix}/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{filename}".lstrip("/").replace("//", "/")
                     public_url = upload_to_supabase(supabase_bucket, object_name, img_path, content_type="image/png")
                     if public_url:
@@ -373,15 +383,11 @@ async def extract_all(
     include_base64: bool = Form(False),
     include_csv_base64: bool = Form(True),
     skip_ocr: bool = Form(False),
+    page_limit: Optional[int] = Form(None),
     supabase_bucket: str = Form("public-images"),
     supabase_prefix: str = Form(""),
     _: str = Depends(verify_token),
 ) -> JSONResponse:
-    """
-    Extract both tables and images in one call.
-    Returns a compact structure with 'tables', 'images', and 'results' list.
-    To keep payloads small in cloud, base64 is OFF by default.
-    """
     temp_dir = tempfile.mkdtemp()
     temp_path = Path(temp_dir)
     try:
@@ -390,6 +396,7 @@ async def extract_all(
             shutil.copyfileobj(file.file, f)
 
         actual_workers = resolve_workers(request, workers)
+        actual_limit = resolve_page_limit(request, page_limit)
 
         # --- Tables ---
         tables_dir = temp_path / "tables"
@@ -402,11 +409,12 @@ async def extract_all(
             "--min-quality", str(min_quality),
             "--clear-output",
         ]
+        if actual_limit:
+            tables_cmd.extend(["--page-limit", str(actual_limit)])
         logger.info("Running tables cmd: %s", " ".join(tables_cmd))
         tables_res = subprocess.run(tables_cmd, capture_output=True, text=True, timeout=int(os.environ.get("TABLES_TIMEOUT_SEC", "1200")))
         if tables_res.returncode != 0:
             logger.error("Tables extractor failed: %s", tables_res.stderr)
-            # Do not abort; continue to images so caller gets partials
         tables_meta = {}
         if (tables_dir / "extraction_metadata.json").exists():
             tables_meta = _read_json(tables_dir / "extraction_metadata.json")
@@ -443,8 +451,10 @@ async def extract_all(
             "--vector-threshold", str(vector_threshold),
             "--clear-output",
         ]
+        if actual_limit:
+            images_cmd.extend(["--page-limit", str(actual_limit)])
         if skip_ocr:
-            images_cmd.append("--skip-ocr")
+            images_cmd.append("--no-ocr")
         logger.info("Running images cmd: %s", " ".join(images_cmd))
         images_res = subprocess.run(images_cmd, capture_output=True, text=True, timeout=int(os.environ.get("IMAGES_TIMEOUT_SEC", "900")))
         if images_res.returncode != 0:
@@ -469,7 +479,6 @@ async def extract_all(
                 "metadata": im.get("metadata", {}),
             }
             if img_path and img_path.exists():
-                # Try Supabase upload (keeps response small)
                 if os.environ.get("SUPABASE_URL") and (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")):
                     object_name = f"{supabase_prefix}/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{filename}".lstrip("/").replace("//", "/")
                     public_url = upload_to_supabase(supabase_bucket, object_name, img_path, content_type="image/png")
@@ -484,7 +493,7 @@ async def extract_all(
                         entry["base64_content"] = None
             images_out.append(entry)
 
-        # --- Unified results (page/index-sorted) ---
+        # --- Unified results ---
         results: List[Dict[str, Any]] = []
         for t in tables_out:
             results.append({
