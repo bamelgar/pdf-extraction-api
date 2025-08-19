@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed  # <-- ADDED (parallel IO/encode)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -69,17 +70,17 @@ async def extract_tables(
 ):
     """Extract tables from PDF using the enterprise extractor"""
     temp_dir = tempfile.mkdtemp()
-    
+
     try:
         # Save uploaded file
         pdf_path = os.path.join(temp_dir, "input.pdf")
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        
+
         # Create output directory
         output_dir = os.path.join(temp_dir, "tables")
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Run the extraction script
         cmd = [
             sys.executable,
@@ -90,23 +91,23 @@ async def extract_tables(
             "--min-quality", str(min_quality),
             "--clear-output"
         ]
-        
+
         logger.info(f"Running command: {' '.join(cmd)}")
-        
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=300  # 5 minute timeout
         )
-        
+
         if result.returncode != 0:
             logger.error(f"Extraction failed: {result.stderr}")
             raise HTTPException(
                 status_code=500,
                 detail=f"Extraction failed: {result.stderr}"
             )
-        
+
         # Read the metadata file
         metadata_path = os.path.join(output_dir, "extraction_metadata.json")
         if not os.path.exists(metadata_path):
@@ -114,24 +115,24 @@ async def extract_tables(
                 status_code=500,
                 detail="No metadata file generated"
             )
-        
+
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
-        
+
         # Process each table
         tables = []
         for table_info in metadata.get('tables', []):
             csv_path = os.path.join(output_dir, table_info['filename'])
-            
+
             if os.path.exists(csv_path):
                 # Read CSV content
                 with open(csv_path, 'r', encoding='utf-8') as f:
                     csv_content = f.read()
-                
+
                 # Read as base64
                 with open(csv_path, 'rb') as f:
                     csv_base64 = base64.b64encode(f.read()).decode('utf-8')
-                
+
                 tables.append({
                     'filename': table_info['filename'],
                     'page_number': table_info['page_number'],
@@ -144,14 +145,14 @@ async def extract_tables(
                     'csv_base64': csv_base64,
                     'metadata': table_info.get('metadata', {})
                 })
-        
+
         return {
             'success': True,
             'tables_count': len(tables),
             'tables': tables,
             'statistics': metadata.get('statistics', {})
         }
-        
+
     except subprocess.TimeoutExpired:
         raise HTTPException(
             status_code=504,
@@ -179,17 +180,17 @@ async def extract_images(
 ):
     """Extract images from PDF using the enterprise extractor"""
     temp_dir = tempfile.mkdtemp()
-    
+
     try:
         # Save uploaded file
         pdf_path = os.path.join(temp_dir, "input.pdf")
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        
+
         # Create output directory
         output_dir = os.path.join(temp_dir, "images")
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Run the extraction script
         cmd = [
             sys.executable,
@@ -202,67 +203,84 @@ async def extract_images(
             "--min-height", str(min_height),
             "--clear-output"
         ]
-        
+
         logger.info(f"Running command: {' '.join(cmd)}")
-        
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=300  # 5 minute timeout
         )
-        
+
         if result.returncode != 0:
             logger.error(f"Extraction failed: {result.stderr}")
             # Don't fail completely, log the error
             logger.warning("Continuing despite extraction errors")
-        
+
         # Read the metadata file if it exists
         metadata_path = os.path.join(output_dir, "extraction_metadata.json")
         metadata = {}
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
-        
-        # Process each image
+
+        # ---------- PARALLEL IMAGE ENCODING (DROP-IN SPEEDUP) ----------
         images = []
-        image_files = [f for f in os.listdir(output_dir) if f.endswith('.png')]
-        
-        for img_file in image_files:
+
+        # Pre-index metadata for O(1) lookups
+        meta_map = {}
+        for img_info in metadata.get('images', []):
+            fn = img_info.get('filename')
+            if fn:
+                meta_map[fn] = img_info
+
+        image_files = [f for f in os.listdir(output_dir) if f.lower().endswith('.png')]
+        encode_workers = max(1, min(workers, (os.cpu_count() or 4)))
+
+        def build_image_record(img_file: str):
             img_path = os.path.join(output_dir, img_file)
-            
-            # Read image as base64
-            with open(img_path, 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
-            
-            # Find metadata for this image
-            img_metadata = {}
-            for img_info in metadata.get('images', []):
-                if img_info.get('filename') == img_file:
-                    img_metadata = img_info
-                    break
-            
-            images.append({
+            try:
+                # Large buffer for faster disk IO on big files
+                with open(img_path, 'rb', buffering=1 << 20) as f:
+                    img_bytes = f.read()
+                img_base64 = base64.b64encode(img_bytes).decode('ascii')
+            except Exception as e:
+                logger.error(f"Failed to read/encode image {img_path}: {e}")
+                img_base64 = ""
+
+            info = meta_map.get(img_file, {})
+            rec = {
                 'filename': img_file,
-                'page_number': img_metadata.get('page_number', 0),
-                'image_index': img_metadata.get('image_index', 0),
-                'image_type': img_metadata.get('image_type', 'unknown'),
-                'quality_score': img_metadata.get('quality_score', 0.5),
-                'width': img_metadata.get('width', 0),
-                'height': img_metadata.get('height', 0),
-                'has_text': img_metadata.get('has_text', False),
-                'text_content': img_metadata.get('text_content', ''),
-                'image_base64': img_base64,
-                'metadata': img_metadata
-            })
-        
+                'page_number': info.get('page_number', 0),
+                'image_index': info.get('image_index', 0),
+                'image_type': info.get('image_type', 'unknown'),
+                'quality_score': info.get('quality_score', 0.5),
+                'width': info.get('width', 0),
+                'height': info.get('height', 0),
+                'has_text': info.get('has_text', False),
+                'text_content': info.get('text_content', ''),
+                'image_base64': img_base64,          # original field (unchanged)
+                'metadata': info
+            }
+            # Non-breaking mirror (helps cloud branch if it expects this key)
+            rec['base64_content'] = img_base64
+            return rec
+
+        logger.info(f"Parallel encoding {len(image_files)} images with {encode_workers} threads")
+        with ThreadPoolExecutor(max_workers=encode_workers) as ex:
+            futures = [ex.submit(build_image_record, f) for f in image_files]
+            for fut in as_completed(futures):
+                images.append(fut.result())
+        # ---------- END PARALLEL IMAGE ENCODING ------------------------
+
         return {
             'success': True,
             'images_count': len(images),
             'images': images,
             'statistics': metadata.get('statistics', {})
         }
-        
+
     except subprocess.TimeoutExpired:
         raise HTTPException(
             status_code=504,
@@ -290,26 +308,26 @@ async def extract_all(
 ):
     """Extract both tables and images from PDF - mimics the original orchestrator script"""
     temp_dir = tempfile.mkdtemp()
-    
+
     try:
         # Save uploaded file
         pdf_path = os.path.join(temp_dir, "input.pdf")
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        
+
         # Log file details
         file_size = os.path.getsize(pdf_path)
         logger.info(f"Processing PDF: {file.filename}, Size: {file_size} bytes, Temp path: {pdf_path}")
-        
+
         # Create output directories
         tables_dir = os.path.join(temp_dir, "pdf_tables")
         images_dir = os.path.join(temp_dir, "pdf_images")
         os.makedirs(tables_dir, exist_ok=True)
         os.makedirs(images_dir, exist_ok=True)
-        
+
         all_results = []
-        
-        # Extract tables
+
+        # ---- TABLES (unchanged) ----
         logger.info("Extracting tables...")
         table_cmd = [
             sys.executable,
@@ -320,9 +338,9 @@ async def extract_all(
             "--min-quality", str(min_quality),
             "--clear-output"
         ]
-        
+
         logger.info(f"Running command: {' '.join(table_cmd)}")
-        
+
         try:
             table_result = subprocess.run(
                 table_cmd,
@@ -330,25 +348,25 @@ async def extract_all(
                 text=True,
                 timeout=300
             )
-            
+
             logger.info(f"Table extraction exit code: {table_result.returncode}")
             logger.info(f"Table stdout (first 500 chars): {table_result.stdout[:500]}")
             if table_result.stderr:
                 logger.error(f"Table stderr: {table_result.stderr[:1000]}")
-            
+
             if table_result.returncode == 0:
                 # List files in output directory
                 table_files = os.listdir(tables_dir)
                 logger.info(f"Files in tables directory: {table_files}")
-                
+
                 # Read table metadata
                 table_metadata_path = os.path.join(tables_dir, "extraction_metadata.json")
                 if os.path.exists(table_metadata_path):
                     with open(table_metadata_path, 'r') as f:
                         table_metadata = json.load(f)
-                    
+
                     logger.info(f"Found {len(table_metadata.get('tables', []))} tables in metadata")
-                    
+
                     for table_info in table_metadata.get('tables', []):
                         # Build the result item
                         result_item = {
@@ -369,7 +387,7 @@ async def extract_all(
                             "metadata": table_info.get('metadata', {}),
                             "mimeType": "text/csv"
                         }
-                        
+
                         # ADD CSV CONTENT READING HERE
                         csv_path = os.path.join(tables_dir, table_info['filename'])
                         if os.path.exists(csv_path):
@@ -383,17 +401,17 @@ async def extract_all(
                         else:
                             logger.warning(f"CSV file not found: {csv_path}")
                             result_item["csv_content"] = ""
-                        
+
                         all_results.append(result_item)
                 else:
                     logger.warning("No table metadata file found")
-                        
+
         except subprocess.TimeoutExpired:
             logger.error("Table extraction timed out")
         except Exception as e:
             logger.error(f"Table extraction error: {e}", exc_info=True)
-        
-        # Extract images
+
+        # ---- IMAGES (parallel base64 encoding) ----
         logger.info("Extracting images...")
         image_cmd = [
             sys.executable,
@@ -407,9 +425,9 @@ async def extract_all(
             "--vector-threshold", "10",
             "--clear-output"
         ]
-        
+
         logger.info(f"Running command: {' '.join(image_cmd)}")
-        
+
         try:
             image_result = subprocess.run(
                 image_cmd,
@@ -417,77 +435,85 @@ async def extract_all(
                 text=True,
                 timeout=300
             )
-            
+
             logger.info(f"Image extraction exit code: {image_result.returncode}")
             logger.info(f"Image stdout (first 500 chars): {image_result.stdout[:500]}")
             if image_result.stderr:
                 logger.error(f"Image stderr: {image_result.stderr[:1000]}")
-            
+
             if image_result.returncode == 0:
                 # List files in output directory
-                image_files = os.listdir(images_dir)
+                image_files = [f for f in os.listdir(images_dir) if f.lower().endswith('.png')]
                 logger.info(f"Files in images directory: {image_files}")
-                
+
                 # Read image metadata
                 image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
+                image_metadata = {}
                 if os.path.exists(image_metadata_path):
                     with open(image_metadata_path, 'r') as f:
                         image_metadata = json.load(f)
-                    
-                    logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata")
-                    
-                    for img_info in image_metadata.get('images', []):
-                        # Format exactly as the original Python script
-                        result_item = {
-                            "type": "image",
-                            "page": img_info['page_number'],
-                            "index": img_info['image_index'],
-                            "filePath": f"/data/pdf_images/{img_info['filename']}",
-                            "fileName": img_info['filename'],
-                            "image_type": img_info.get('image_type', 'general_image'),
-                            "extraction_method": img_info.get('extraction_method', 'unknown'),
-                            "quality_score": img_info.get('quality_score', 0.0),
-                            "width": img_info.get('width', 0),
-                            "height": img_info.get('height', 0),
-                            "has_text": img_info.get('has_text', False),
-                            "text_content": img_info.get('text_content', ''),
-                            "caption": img_info.get('context', {}).get('caption'),
-                            "figure_reference": img_info.get('context', {}).get('figure_reference'),
-                            "visual_elements": img_info.get('visual_elements', {}),
-                            "vector_count": img_info.get('vector_count'),
-                            "enhancement_applied": img_info.get('enhancement_applied', False),
-                            "mimeType": "image/png"
-                        }
-                        
-                        # ADD BASE64 IMAGE CONTENT
-                        img_path = os.path.join(images_dir, img_info['filename'])
-                        if os.path.exists(img_path):
-                            try:
-                                with open(img_path, 'rb') as f:
-                                    img_base64 = base64.b64encode(f.read()).decode('utf-8')
-                                result_item["base64_content"] = img_base64
-                                logger.info(f"Added base64 for {img_info['filename']}, size: {len(img_base64)} chars")
-                            except Exception as e:
-                                logger.warning(f"Could not read image {img_info['filename']}: {e}")
-                                result_item["base64_content"] = None
-                        else:
-                            logger.warning(f"Image file not found: {img_path}")
-                            result_item["base64_content"] = None
-                        
-                        all_results.append(result_item)
-                else:
-                    logger.warning("No image metadata file found")
-                        
+
+                logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata")
+
+                # Pre-index metadata for O(1) lookups
+                image_meta_map = {}
+                for img_info in image_metadata.get('images', []):
+                    fn = img_info.get('filename')
+                    if fn:
+                        image_meta_map[fn] = img_info
+
+                encode_workers = max(1, min(workers, (os.cpu_count() or 4)))
+
+                def build_result_item(img_file: str):
+                    img_path = os.path.join(images_dir, img_file)
+                    info = image_meta_map.get(img_file, {})
+                    try:
+                        with open(img_path, 'rb', buffering=1 << 20) as f:
+                            img_b64 = base64.b64encode(f.read()).decode('ascii')
+                    except Exception as e:
+                        logger.error(f"Failed to read/encode image {img_path}: {e}")
+                        img_b64 = ""
+
+                    # Keep your existing fields; add both names for base64 for compatibility
+                    return {
+                        "type": "image",
+                        "page": info.get('page_number', 0),
+                        "index": info.get('image_index', 0),
+                        "filePath": f"/data/pdf_images/{img_file}",
+                        "fileName": img_file,
+                        "image_type": info.get('image_type', 'general_image'),
+                        "extraction_method": info.get('extraction_method', 'unknown'),
+                        "quality_score": info.get('quality_score', 0.0),
+                        "width": info.get('width', 0),
+                        "height": info.get('height', 0),
+                        "has_text": info.get('has_text', False),
+                        "text_content": info.get('text_content', ''),
+                        "caption": info.get('context', {}).get('caption'),
+                        "figure_reference": info.get('context', {}).get('figure_reference'),
+                        "visual_elements": info.get('visual_elements', {}),
+                        "vector_count": info.get('vector_count'),
+                        "enhancement_applied": info.get('enhancement_applied', False),
+                        "mimeType": "image/png",
+                        "base64_content": img_b64,  # normalized name (cloud branch)
+                        "image_base64": img_b64     # original name (legacy)
+                    }
+
+                logger.info(f"Parallel encoding {len(image_files)} images with {encode_workers} threads (/extract/all)")
+                with ThreadPoolExecutor(max_workers=encode_workers) as ex:
+                    futures = [ex.submit(build_result_item, f) for f in image_files]
+                    for fut in as_completed(futures):
+                        all_results.append(fut.result())
+
         except subprocess.TimeoutExpired:
             logger.error("Image extraction timed out")
         except Exception as e:
             logger.error(f"Image extraction error: {e}", exc_info=True)
-        
+
         # Sort results by page and index (like the original script)
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
-        
+
         logger.info(f"Total results: {len(all_results)} items")
-        
+
         # CRITICAL FIX: Return wrapped response to prevent n8n from unwrapping single-item arrays
         return {
             "results": all_results,
@@ -495,7 +521,7 @@ async def extract_all(
             "extraction_timestamp": datetime.now().isoformat(),
             "success": True
         }
-        
+
     except Exception as e:
         logger.error(f"Extraction error: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -519,13 +545,13 @@ async def check_environment():
         },
         "installed_packages": []
     }
-    
+
     # Check for required packages
     required_packages = [
-        "pdfplumber", "pandas", "numpy", "camelot-py", 
+        "pdfplumber", "pandas", "numpy", "camelot-py",
         "tabula-py", "PyMuPDF", "PIL", "cv2", "pytesseract"
     ]
-    
+
     for package in required_packages:
         try:
             if package == "PyMuPDF":
@@ -543,16 +569,16 @@ async def check_environment():
             checks["installed_packages"].append({"package": package, "installed": True})
         except ImportError:
             checks["installed_packages"].append({"package": package, "installed": False})
-    
+
     # Check for system dependencies
     checks["system_checks"] = {
         "java_available": shutil.which("java") is not None,
         "tesseract_available": shutil.which("tesseract") is not None
     }
-    
+
     # List files in current directory
     checks["files_in_directory"] = os.listdir(".")
-    
+
     # Test simple extraction
     try:
         result = subprocess.run(
@@ -568,7 +594,7 @@ async def check_environment():
         }
     except Exception as e:
         checks["test_import"] = {"error": str(e)}
-    
+
     return checks
 
 @app.get("/test")
