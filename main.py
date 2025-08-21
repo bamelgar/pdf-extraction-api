@@ -534,7 +534,7 @@ async def extract_all(
                         "enhancement_applied": info.get('enhancement_applied', False),
                         "mimeType": "image/png",
                         # keep image payload inline for downstream (original behavior)
-                        "image_base64": img_base64
+                        "base64_content": img_base64
                     }
 
                     all_results.append(result_item)
