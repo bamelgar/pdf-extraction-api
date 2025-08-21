@@ -558,7 +558,17 @@ class EnterpriseImageExtractor:
         """Main extraction method with parallel processing - TESTING VERSION"""
         start_time = datetime.now()
         
-        logger.info(f"Starting enhanced image extraction with {self.max_workers} workers")
+        # TESTING DIAGNOSTICS AND LIMITERS
+        logger.info(f"[DIAGNOSTICS] TESTING_IMAGE_LIMIT env var: {os.environ.get('TESTING_IMAGE_LIMIT', 'NOT SET')}")
+        logger.info(f"[DIAGNOSTICS] Parsed testing_image_limit: {self.testing_image_limit}")
+        
+        if self.testing_image_limit > 0:
+            logger.info(f"[TESTING MODE] Will stop after extracting {self.testing_image_limit} images")
+            self._should_stop_extraction = False
+        else:
+            logger.info(f"[PRODUCTION MODE] No testing limit set - will process all images")
+        
+        logger.info(f"[DIAGNOSTICS] Starting enhanced image extraction with {self.max_workers} workers")
         
         # Open PDF to get page count
         doc = fitz.open(self.pdf_path)
@@ -568,6 +578,8 @@ class EnterpriseImageExtractor:
             logger.info(f"Page limit set: processing first {total_pages} pages only")
         self.extraction_stats['total_pages'] = total_pages
         doc.close()
+        
+        logger.info(f"[DIAGNOSTICS] Total pages to process: {total_pages}")
         
         # Process pages in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -594,15 +606,19 @@ class EnterpriseImageExtractor:
                     page_images = future.result()
                     if page_images:
                         self.extraction_stats['pages_with_images'] += 1
+                        logger.info(f"[DIAGNOSTICS] Page {page_num + 1} found {len(page_images)} images")
                         for img_info in page_images:
                             self._save_image(img_info)
                             
                             # TESTING ONLY - Check if we should stop
                             if self._should_stop_extraction:
+                                logger.info(f"[TESTING MODE] Breaking from image processing loop")
                                 break
                         
                         if self._should_stop_extraction:
                             break
+                    else:
+                        logger.debug(f"[DIAGNOSTICS] Page {page_num + 1} found no images")
                             
                 except Exception as e:
                     logger.error(f"Failed to process page {page_num + 1}: {e}")
@@ -633,7 +649,7 @@ class EnterpriseImageExtractor:
         if self.save_metadata:
             self._save_extraction_metadata()
         
-        logger.info(f"Extraction complete: {len(self.extracted_images)} images extracted")
+        logger.info(f"[DIAGNOSTICS] Extraction complete: {len(self.extracted_images)} images extracted")
         logger.info(f"  - Embedded images: {self.extraction_stats['embedded_images_found']}")
         logger.info(f"  - Vector graphics: {self.extraction_stats['vector_graphics_found']}")
         
@@ -655,8 +671,10 @@ class EnterpriseImageExtractor:
         
         # TESTING ONLY - Check early exit
         if self._should_stop_extraction:
+            logger.info(f"[TESTING MODE] Skipping page {page_num + 1} due to early exit")
             return []
             
+        logger.debug(f"[DIAGNOSTICS] Processing page {page_num + 1}")
         doc = fitz.open(self.pdf_path)
         page = doc[page_num]
         page_images = []
@@ -666,6 +684,12 @@ class EnterpriseImageExtractor:
         if embedded_images:
             page_images.extend(embedded_images)
             self.extraction_stats['embedded_images_found'] += len(embedded_images)
+            logger.debug(f"[DIAGNOSTICS] Page {page_num + 1} found {len(embedded_images)} embedded images")
+        
+        # TESTING ONLY - Check early exit before vector processing
+        if self._should_stop_extraction:
+            doc.close()
+            return page_images
         
         # Extract vector graphics
         vector_graphics = self._extract_vector_graphics(page, page_num + 1)
@@ -673,8 +697,10 @@ class EnterpriseImageExtractor:
             page_images.extend(vector_graphics)
             self.extraction_stats['vector_graphics_found'] += len(vector_graphics)
             self.extraction_stats['pages_with_vector_graphics'] += 1
+            logger.debug(f"[DIAGNOSTICS] Page {page_num + 1} found {len(vector_graphics)} vector graphics")
         
         doc.close()
+        logger.debug(f"[DIAGNOSTICS] Page {page_num + 1} total images: {len(page_images)}")
         return page_images
     
     def _extract_embedded_images(self, page: fitz.Page, page_num: int) -> List[Dict]:
@@ -682,10 +708,13 @@ class EnterpriseImageExtractor:
         images = []
         image_list = page.get_images()
         
+        logger.debug(f"[DIAGNOSTICS] Page {page_num} has {len(image_list)} embedded images to check")
+        
         for img_index, img in enumerate(image_list):
             
             # TESTING ONLY - Check early exit
             if self._should_stop_extraction:
+                logger.info(f"[TESTING MODE] Breaking from embedded image extraction on page {page_num}")
                 break
                 
             try:
@@ -704,13 +733,17 @@ class EnterpriseImageExtractor:
                 
                 # Check minimum size
                 if image.width < self.min_size[0] or image.height < self.min_size[1]:
+                    logger.debug(f"[DIAGNOSTICS] Page {page_num} image {img_index} too small: {image.width}x{image.height}")
                     continue
                 
                 # Calculate quality score
                 quality_score, quality_metrics = QualityAnalyzer.calculate_quality_score(image)
                 
                 if quality_score < self.min_quality_score:
+                    logger.debug(f"[DIAGNOSTICS] Page {page_num} image {img_index} quality too low: {quality_score:.2f}")
                     continue
+                
+                logger.info(f"[DIAGNOSTICS] Page {page_num} image {img_index} passed filters: {image.width}x{image.height}, quality {quality_score:.2f}")
                 
                 # Extract text if OCR enabled
                 text_content = ""
@@ -773,6 +806,8 @@ class EnterpriseImageExtractor:
         drawings = page.get_drawings()
         vector_count = len(drawings)
         
+        logger.debug(f"[DIAGNOSTICS] Page {page_num} has {vector_count} vector drawings (threshold: {self.vector_threshold})")
+        
         # Only extract if significant vector content
         if vector_count >= self.vector_threshold:
             try:
@@ -822,6 +857,7 @@ class EnterpriseImageExtractor:
                 }
                 
                 graphics.append(img_info)
+                logger.info(f"[DIAGNOSTICS] Page {page_num} vector graphics extracted: {image_type}")
                 
             except Exception as e:
                 logger.error(f"Failed to extract vector graphics from page {page_num}: {e}")
@@ -880,4 +916,319 @@ class EnterpriseImageExtractor:
         text = page.get_text()
         
         # Look for title
-        text_blocks =
+        text_blocks = page.get_text("blocks")
+        if text_blocks:
+            for block in text_blocks[:3]:
+                if len(block) >= 5:
+                    potential_title = block[4].strip()
+                    if len(potential_title) > 10 and len(potential_title) < 100:
+                        context['page_title'] = potential_title
+                        break
+        
+        # Get text preview
+        context['page_text_preview'] = text[:200] + "..." if len(text) > 200 else text
+        
+        # Find exhibit references
+        exhibit_matches = re.findall(r'Exhibit\s*\d+', text, re.IGNORECASE)
+        context['exhibits_mentioned'] = list(set(exhibit_matches))
+        
+        return context
+    
+    def _save_image(self, img_info: Dict):
+        """Save image with metadata - TESTING VERSION"""
+        
+        # TESTING ONLY - Check if we should stop before saving
+        if self.testing_image_limit > 0:
+            current_count = len(self.extracted_images)
+            logger.info(f"[TESTING DIAGNOSTICS] Current image count: {current_count}, Limit: {self.testing_image_limit}")
+            
+            if current_count >= self.testing_image_limit:
+                logger.info(f"[TESTING MODE] Reached limit of {self.testing_image_limit} images - stopping extraction")
+                self._should_stop_extraction = True
+                self.extraction_stats['testing_limit_reached'] = True
+                return  # Skip saving this image
+        
+        page_num = img_info['page_number']
+        img_index = img_info['image_index']
+        image_type = img_info['image_type']
+        extraction_method = img_info['extraction_method']
+        
+        # Generate filename
+        if extraction_method == 'vector_render':
+            filename = f"page_{page_num}_vector_{image_type}.png"
+        else:
+            filename = f"page_{page_num}_img_{img_index}_{image_type}.png"
+        
+        filepath = self.output_dir / filename
+        
+        # Atomic save
+        if not self._atomic_save_image(img_info['image'], filepath):
+            logger.error(f"Failed to save image {filename}")
+            return
+        
+        # Calculate file size
+        file_size = filepath.stat().st_size
+        
+        # Create metadata
+        metadata = ImageMetadata(
+            filename=filename,
+            page_number=page_num,
+            image_index=img_index,
+            image_type=image_type,
+            extraction_method=extraction_method,
+            width=img_info['image'].width,
+            height=img_info['image'].height,
+            quality_score=img_info['quality_score'],
+            has_text=bool(img_info['text_content']),
+            text_content=img_info['text_content'],
+            visual_elements=img_info['type_metadata'],
+            extraction_timestamp=datetime.now().isoformat(),
+            file_size=file_size,
+            dpi=96,
+            color_mode=img_info['image'].mode,
+            enhancement_applied=self.enable_enhancement,
+            context=img_info['context'],
+            vector_count=img_info.get('vector_count')
+        )
+        
+        # Thread-safe update
+        with self._images_lock:
+            self.extracted_images.append(metadata)
+            
+            # Update statistics
+            self.extraction_stats['image_types_found'][image_type] += 1
+            
+            if metadata.quality_score >= 0.7:
+                self.extraction_stats['quality_distribution']['high'] += 1
+            elif metadata.quality_score >= 0.4:
+                self.extraction_stats['quality_distribution']['medium'] += 1
+            else:
+                self.extraction_stats['quality_distribution']['low'] += 1
+        
+        logger.info(f"[DIAGNOSTICS] Saved {filename} - Type: {image_type}, Method: {extraction_method}, Quality: {metadata.quality_score:.2f}")
+    
+    def _verify_saved_files(self) -> List[Dict]:
+        """Verify all saved image files"""
+        issues = []
+        png_files = list(self.output_dir.glob("*.png"))
+        
+        logger.info(f"Verifying {len(png_files)} image files...")
+        
+        for png_file in png_files:
+            try:
+                # Check file size
+                if png_file.stat().st_size == 0:
+                    issues.append({
+                        'file': png_file.name,
+                        'issue': 'empty_file',
+                        'severity': 'critical'
+                    })
+                    continue
+                
+                # Verify image integrity
+                img = Image.open(png_file)
+                img.verify()
+                
+                # Re-open for additional checks
+                img = Image.open(png_file)
+                
+                # Check dimensions
+                if img.width < 10 or img.height < 10:
+                    issues.append({
+                        'file': png_file.name,
+                        'issue': 'too_small',
+                        'width': img.width,
+                        'height': img.height,
+                        'severity': 'warning'
+                    })
+                
+            except Exception as e:
+                issues.append({
+                    'file': png_file.name,
+                    'issue': 'corrupt_image',
+                    'error': str(e),
+                    'severity': 'critical'
+                })
+        
+        # Check for missing files
+        metadata_files = {img.filename for img in self.extracted_images}
+        actual_files = {f.name for f in png_files}
+        
+        missing_files = metadata_files - actual_files
+        for missing in missing_files:
+            issues.append({
+                'file': missing,
+                'issue': 'file_missing',
+                'severity': 'critical'
+            })
+        
+        if issues:
+            critical_count = sum(1 for i in issues if i.get('severity') == 'critical')
+            logger.warning(f"Verification found {len(issues)} issues ({critical_count} critical)")
+        else:
+            logger.info("All files verified successfully!")
+        
+        return issues
+    
+    def _save_extraction_metadata(self):
+        """Save extraction metadata and statistics"""
+        metadata_file = self.output_dir / 'extraction_metadata.json'
+        
+        metadata = {
+            'pdf_file': str(self.pdf_path),
+            'extraction_timestamp': datetime.now().isoformat(),
+            'configuration': {
+                'min_width': self.min_size[0],
+                'min_height': self.min_size[1],
+                'min_quality_score': self.min_quality_score,
+                'vector_threshold': self.vector_threshold,
+                'enable_ocr': self.enable_ocr,
+                'enable_enhancement': self.enable_enhancement,
+                'max_workers': self.max_workers,
+                'page_limit': self.page_limit,
+                'testing_image_limit': self.testing_image_limit
+            },
+            'statistics': dict(self.extraction_stats),
+            'images': [asdict(img) for img in self.extracted_images]
+        }
+        
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Saved metadata to {metadata_file}")
+
+def main():
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Enterprise PDF Image Extractor v1.0+ (Enhanced) - TESTING VERSION'
+    )
+    parser.add_argument('pdf_path', help='Path to PDF file', nargs='?', default='/data/input.pdf')
+    parser.add_argument(
+        '--output-dir',
+        default='/data/pdf_images',
+        help='Output directory for extracted images'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='Number of parallel workers (0=auto)'
+    )
+    parser.add_argument(
+        '--min-width',
+        type=int,
+        default=100,
+        help='Minimum image width'
+    )
+    parser.add_argument(
+        '--min-height',
+        type=int,
+        default=100,
+        help='Minimum image height'
+    )
+    parser.add_argument(
+        '--min-quality',
+        type=float,
+        default=0.3,
+        help='Minimum quality score (0-1)'
+    )
+    parser.add_argument(
+        '--vector-threshold',
+        type=int,
+        default=10,
+        help='Minimum vector count to extract page as image'
+    )
+    parser.add_argument(
+        '--no-ocr',
+        action='store_true',
+        help='Disable OCR text extraction'
+    )
+    parser.add_argument(
+        '--no-enhance',
+        action='store_true',
+        help='Disable image enhancement'
+    )
+    parser.add_argument(
+        '--clear-output',
+        action='store_true',
+        help='Clear output directory before extraction'
+    )
+    parser.add_argument(
+        '--page-limit',
+        type=int,
+        default=None,
+        help='Limit extraction to first N pages (for testing)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Auto-detect optimal workers
+    if args.workers == 0:
+        args.workers = min(16, os.cpu_count() or 1)
+        logger.info(f"Auto-detected {args.workers} workers")
+    
+    # Configuration
+    config = {
+        'min_width': args.min_width,
+        'min_height': args.min_height,
+        'min_quality_score': args.min_quality,
+        'enable_ocr': not args.no_ocr,
+        'enable_enhancement': not args.no_enhance,
+        'vector_threshold': args.vector_threshold,
+        'save_metadata': True,
+        'max_workers': args.workers,
+        'clear_output': args.clear_output,
+        'page_limit': args.page_limit
+    }
+    
+    # Extract images
+    extractor = EnterpriseImageExtractor(
+        args.pdf_path,
+        args.output_dir,
+        config
+    )
+    
+    images = extractor.extract_all_images()
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("EXTRACTION SUMMARY - TESTING VERSION")
+    print("="*60)
+    print(f"Total pages processed: {extractor.extraction_stats['total_pages']}")
+    print(f"Pages with images: {extractor.extraction_stats['pages_with_images']}")
+    print(f"Pages with vector graphics: {extractor.extraction_stats['pages_with_vector_graphics']}")
+    print(f"Total images extracted: {len(images)}")
+    print(f"  - Embedded images: {extractor.extraction_stats['embedded_images_found']}")
+    print(f"  - Vector graphics: {extractor.extraction_stats['vector_graphics_found']}")
+    print(f"OCR success rate: {extractor.extraction_stats['ocr_success_rate']:.1%}")
+    print(f"Extraction time: {extractor.extraction_stats['total_extraction_time']:.2f}s")
+    print(f"Parallel workers used: {config['max_workers']}")
+    
+    if extractor.testing_image_limit > 0:
+        print(f"[TESTING MODE] Limit was {extractor.testing_image_limit}, extracted {len(images)}")
+        print(f"[TESTING MODE] Limit reached: {extractor.extraction_stats['testing_limit_reached']}")
+    
+    if extractor.extraction_stats['extraction_errors']:
+        print(f"\nExtraction errors: {len(extractor.extraction_stats['extraction_errors'])}")
+    
+    print("\nImage Types Found:")
+    for img_type, count in sorted(
+        extractor.extraction_stats['image_types_found'].items(),
+        key=lambda x: x[1],
+        reverse=True
+    ):
+        print(f"  {img_type}: {count}")
+    
+    print("\nQuality Distribution:")
+    for quality, count in extractor.extraction_stats['quality_distribution'].items():
+        print(f"  {quality.capitalize()}: {count}")
+    
+    if 'verification_issues' in extractor.extraction_stats:
+        issues = extractor.extraction_stats['verification_issues']
+        critical = sum(1 for i in issues if i.get('severity') == 'critical')
+        print(f"\nVerification issues: {len(issues)} ({critical} critical)")
+
+if __name__ == "__main__":
+    main()
