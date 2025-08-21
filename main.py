@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
-app = FastAPI(title="PDF Extraction API", version="1.0.0")
+app = FastAPI(title="PDF Extraction API - TESTING VERSION", version="1.0.0-testing")
 
 # Add CORS middleware for n8n
 app.add_middleware(
@@ -40,7 +40,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
 
 def _limit_from(query_value: Optional[int], env_key: str) -> Optional[int]:
     """
-    TEMP TEST LIMITER:
+    TESTING LIMITER:
     - If a positive integer is provided via query param, use it.
     - Else if env var exists and is positive, use it.
     - Else None (no limit).
@@ -62,11 +62,20 @@ def _limit_from(query_value: Optional[int], env_key: str) -> Optional[int]:
 
 @app.get("/")
 async def health_check():
+    # TESTING MODE INDICATOR
+    testing_indicators = {
+        "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
+        "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
+        "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
+        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set")
+    }
+    
     return {
-        "status": "healthy",
-        "service": "PDF Extraction API",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat()
+        "status": "healthy - TESTING MODE",
+        "service": "PDF Extraction API - TESTING VERSION",
+        "version": "1.0.0-testing",
+        "timestamp": datetime.now().isoformat(),
+        "testing_limits": testing_indicators
     }
 
 @app.post("/extract/test")
@@ -79,7 +88,7 @@ async def test_extraction(
         "success": True,
         "filename": file.filename,
         "content_type": file.content_type,
-        "message": "File received successfully"
+        "message": "File received successfully - TESTING MODE"
     }
 
 @app.post("/extract/tables")
@@ -87,7 +96,7 @@ async def extract_tables(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
     workers: int = 4,
-    # TEMP TEST LIMITER (optional)
+    # TESTING LIMITER (optional)
     limit_tables: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
@@ -97,7 +106,7 @@ async def extract_tables(
     # Resolve temp limit
     eff_limit_tables = _limit_from(limit_tables, "TEMP_LIMIT_TABLES")
     if eff_limit_tables:
-        logger.info(f"[TEMP LIMIT] Tables will be limited to first {eff_limit_tables} items (packaging only).")
+        logger.info(f"[TESTING LIMIT] Tables will be limited to first {eff_limit_tables} items (packaging only).")
 
     try:
         # Save uploaded file
@@ -112,7 +121,7 @@ async def extract_tables(
         # Run the extraction script (unchanged)
         cmd = [
             sys.executable,
-            "enterprise_table_extractor_full.py",
+            "enterprise_table_extractor_testing.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
@@ -146,7 +155,7 @@ async def extract_tables(
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
 
-        # Process each table (apply TEMP limit to packaging only)
+        # Process each table (apply TESTING limit to packaging only)
         tables = []
         table_list = metadata.get('tables', [])
         if eff_limit_tables is not None:
@@ -181,7 +190,8 @@ async def extract_tables(
             'success': True,
             'tables_count': len(tables),
             'tables': tables,
-            'statistics': metadata.get('statistics', {})
+            'statistics': metadata.get('statistics', {}),
+            'testing_mode': True
         }
 
     except subprocess.TimeoutExpired:
@@ -207,7 +217,7 @@ async def extract_images(
     min_width: int = 100,
     min_height: int = 100,
     workers: int = 4,
-    # TEMP TEST LIMITER (optional)
+    # TESTING LIMITER (optional)
     limit_images: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
@@ -217,7 +227,7 @@ async def extract_images(
     # Resolve temp limit
     eff_limit_images = _limit_from(limit_images, "TEMP_LIMIT_IMAGES")
     if eff_limit_images:
-        logger.info(f"[TEMP LIMIT] Images will be limited to first {eff_limit_images} items (packaging only).")
+        logger.info(f"[TESTING LIMIT] Images will be limited to first {eff_limit_images} items (packaging only).")
 
     try:
         # Save uploaded file
@@ -232,7 +242,7 @@ async def extract_images(
         # Run the extraction script (unchanged)
         cmd = [
             sys.executable,
-            "enterprise_image_extractor.py",
+            "enterprise_image_extractor_testing.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
@@ -262,7 +272,7 @@ async def extract_images(
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
 
-        # Process each image (apply TEMP limit to packaging only)
+        # Process each image (apply TESTING limit to packaging only)
         images = []
         image_files = [f for f in os.listdir(output_dir) if f.endswith('.png')]
         image_files.sort()  # deterministic order
@@ -302,7 +312,8 @@ async def extract_images(
             'success': True,
             'images_count': len(images),
             'images': images,
-            'statistics': metadata.get('statistics', {})
+            'statistics': metadata.get('statistics', {}),
+            'testing_mode': True
         }
 
     except subprocess.TimeoutExpired:
@@ -328,21 +339,21 @@ async def extract_all(
     workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
-    # TEMP TEST LIMITERS (optional)
+    # TESTING LIMITERS (optional)
     limit_tables: Optional[int] = None,
     limit_images: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
-    """Extract both tables and images from PDF - mimics the original orchestrator script"""
+    """Extract both tables and images from PDF - TESTING VERSION"""
     temp_dir = tempfile.mkdtemp()
 
     # Resolve temp limits
     eff_limit_tables = _limit_from(limit_tables, "TEMP_LIMIT_TABLES")
     eff_limit_images = _limit_from(limit_images, "TEMP_LIMIT_IMAGES")
     if eff_limit_tables:
-        logger.info(f"[TEMP LIMIT] /all: Tables packaging limited to {eff_limit_tables}.")
+        logger.info(f"[TESTING LIMIT] /all: Tables packaging limited to {eff_limit_tables}.")
     if eff_limit_images:
-        logger.info(f"[TEMP LIMIT] /all: Images packaging limited to {eff_limit_images}.")
+        logger.info(f"[TESTING LIMIT] /all: Images packaging limited to {eff_limit_images}.")
 
     try:
         # Save uploaded file
@@ -366,7 +377,7 @@ async def extract_all(
         logger.info("Extracting tables...")
         table_cmd = [
             sys.executable,
-            "enterprise_table_extractor_full.py",
+            "enterprise_table_extractor_testing.py",
             pdf_path,
             "--output-dir", tables_dir,
             "--workers", str(workers),
@@ -446,7 +457,7 @@ async def extract_all(
         logger.info("Extracting images...")
         image_cmd = [
             sys.executable,
-            "enterprise_image_extractor.py",
+            "enterprise_image_extractor_testing.py",
             pdf_path,
             "--output-dir", images_dir,
             "--workers", str(workers),
@@ -544,7 +555,8 @@ async def extract_all(
             "results": all_results,
             "count": len(all_results),
             "extraction_timestamp": datetime.now().isoformat(),
-            "success": True
+            "success": True,
+            "testing_mode": True
         }
 
     except Exception as e:
@@ -565,8 +577,8 @@ async def check_environment():
         "python_version": sys.version,
         "current_directory": os.getcwd(),
         "scripts_exist": {
-            "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
-            "image_extractor": os.path.exists("enterprise_image_extractor.py")
+            "table_extractor": os.path.exists("enterprise_table_extractor_testing.py"),
+            "image_extractor": os.path.exists("enterprise_image_extractor_testing.py")
         },
         "installed_packages": []
     }
@@ -620,15 +632,24 @@ async def check_environment():
     except Exception as e:
         checks["test_import"] = {"error": str(e)}
 
+    # TESTING MODE INDICATORS
+    checks["testing_limits"] = {
+        "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
+        "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
+        "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
+        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set")
+    }
+
     return checks
 
 @app.get("/test")
 async def test_endpoint():
     """Simple test endpoint that doesn't require auth"""
     return {
-        "message": "API is working!",
+        "message": "API is working! - TESTING MODE",
         "timestamp": datetime.now().isoformat(),
-        "python_version": sys.version
+        "python_version": sys.version,
+        "testing_mode": True
     }
 
 if __name__ == "__main__":
