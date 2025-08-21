@@ -118,10 +118,10 @@ async def extract_tables(
         output_dir = os.path.join(temp_dir, "tables")
         os.makedirs(output_dir, exist_ok=True)
 
-        # Run the extraction script (unchanged)
+        # Run the extraction script - CORRECT FILENAME
         cmd = [
             sys.executable,
-            "enterprise_table_extractor_testing.py",
+            "enterprise_table_extractor_full.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
@@ -239,10 +239,10 @@ async def extract_images(
         output_dir = os.path.join(temp_dir, "images")
         os.makedirs(output_dir, exist_ok=True)
 
-        # Run the extraction script (unchanged)
+        # Run the extraction script - CORRECT FILENAME
         cmd = [
             sys.executable,
-            "enterprise_image_extractor_testing.py",
+            "enterprise_image_extractor.py",
             pdf_path,
             "--output-dir", output_dir,
             "--workers", str(workers),
@@ -373,11 +373,11 @@ async def extract_all(
 
         all_results = []
 
-        # Extract tables (unchanged subprocess)
+        # Extract tables - CORRECT FILENAME
         logger.info("Extracting tables...")
         table_cmd = [
             sys.executable,
-            "enterprise_table_extractor_testing.py",
+            "enterprise_table_extractor_full.py",
             pdf_path,
             "--output-dir", tables_dir,
             "--workers", str(workers),
@@ -453,11 +453,11 @@ async def extract_all(
         except Exception as e:
             logger.error(f"Table extraction error: {e}", exc_info=True)
 
-        # Extract images (unchanged subprocess)
+        # Extract images - CORRECT FILENAME
         logger.info("Extracting images...")
         image_cmd = [
             sys.executable,
-            "enterprise_image_extractor_testing.py",
+            "enterprise_image_extractor.py",
             pdf_path,
             "--output-dir", images_dir,
             "--workers", str(workers),
@@ -577,8 +577,8 @@ async def check_environment():
         "python_version": sys.version,
         "current_directory": os.getcwd(),
         "scripts_exist": {
-            "table_extractor": os.path.exists("enterprise_table_extractor_testing.py"),
-            "image_extractor": os.path.exists("enterprise_image_extractor_testing.py")
+            "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
+            "image_extractor": os.path.exists("enterprise_image_extractor.py")
         },
         "installed_packages": []
     }
