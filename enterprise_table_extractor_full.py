@@ -632,7 +632,7 @@ class EnterpriseTableExtractor:
             
             # TESTING ONLY - Check early exit before each method
             if self._should_stop_extraction:
-                logger.info(f"[TESTING MODE] Breaking from extraction method {method_name} on page {page_num}")
+                logger.info(f"[TESTING MODE] Breaking from extraction methods on page {page_num}")
                 break
                 
             try:
@@ -656,7 +656,7 @@ class EnterpriseTableExtractor:
                         # Apply quality filter ONLY if enforce_quality_filter is True
                         if self.enforce_quality_filter and quality_score < self.min_quality_score:
                             self.extraction_stats['tables_filtered_by_quality'] += 1
-                            logger.debug(f"[DIAGNOSTICS] Filtered table on page {page_num} with quality score {quality_score:.2f}")
+                            logger.debug(f"Filtered table on page {page_num} with quality score {quality_score:.2f}")
                             continue
                         
                         # Classify table
@@ -678,7 +678,7 @@ class EnterpriseTableExtractor:
                         }
                         
                         all_tables.append(table_info)
-                        logger.info(f"[DIAGNOSTICS] Page {page_num} found valid table via {method_name}: {table_type}, quality {quality_score:.2f}")
+                        logger.debug(f"[DIAGNOSTICS] Page {page_num} table {len(all_tables)}: {table_type}, quality {quality_score:.2f}")
                         
                         # Update statistics
                         with self._tables_lock:
@@ -694,7 +694,6 @@ class EnterpriseTableExtractor:
         # Remove duplicates
         all_tables = self._remove_duplicate_tables(all_tables)
         
-        logger.debug(f"[DIAGNOSTICS] Page {page_num} total unique tables: {len(all_tables)}")
         return all_tables
     
     def _extract_with_pdfplumber(self, page_num: int) -> List[List[List[Any]]]:
@@ -881,7 +880,7 @@ class EnterpriseTableExtractor:
                 seen_hashes.add(table_hash)
                 unique_tables.append(table)
             else:
-                logger.debug(f"[DIAGNOSTICS] Removed duplicate table on page {table['page']}")
+                logger.debug(f"Removed duplicate table on page {table['page']}")
         
         return unique_tables
     
