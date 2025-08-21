@@ -113,7 +113,7 @@ class TableClassifier:
             'scientific_data': {
                 'keywords': ['experiment', 'sample', 'control', 'mean', 'std', 'p-value', 
                            'significant', 'correlation', 'n=', 'error', 'ci', 'confidence'],
-                'patterns': [r'Ã‚Â±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*Ã‚Â±\s*\d+\.\d+', 
+                'patterns': [r'±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*±\s*\d+\.\d+', 
                            r'r\s*=\s*[0-9.-]+', r'n\s*=\s*\d+'],
                 'metadata_extractors': ['units', 'statistical_measures', 'sample_size', 'p_values']
             },
@@ -186,7 +186,7 @@ class TableClassifier:
         if 'statistical_measures' in config.get('metadata_extractors', []):
             text = str(table_data)
             metadata['has_p_values'] = bool(re.search(r'p\s*[<=]\s*0\.\d+', text))
-            metadata['has_error_bars'] = bool(re.search(r'Ã‚Â±', text))
+            metadata['has_error_bars'] = bool(re.search(r'±', text))
             metadata['has_confidence_intervals'] = bool(re.search(r'(CI|confidence\s*interval)', text, re.I))
         
         if 'fiscal_period' in config.get('metadata_extractors', []):
@@ -201,7 +201,7 @@ class TableClassifier:
     def _detect_currency(table_data):
         """Detect currency in table"""
         currencies = {
-            '$': 'USD', 'Ã¢â€šÂ¬': 'EUR', 'Ã‚Â£': 'GBP', 'Ã‚Â¥': 'JPY', 'CHF': 'CHF',
+            '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', 'CHF': 'CHF',
             'Rs': 'INR', 'R$': 'BRL', 'C$': 'CAD', 'A$': 'AUD', 'HK$': 'HKD'
         }
         
@@ -218,8 +218,8 @@ class TableClassifier:
             # Financial
             r'million', r'billion', r'thousand', r'mn', r'bn', r'k',
             # Scientific
-            r'mg/ml', r'ÃŽÂ¼g/ml', r'ng/ml', r'mM', r'ÃŽÂ¼M', r'nM',
-            r'kDa', r'Da', r'Ã‚Â°C', r'Ã‚Â°F', r'K',
+            r'mg/ml', r'μg/ml', r'ng/ml', r'mM', r'μM', r'nM',
+            r'kDa', r'Da', r'°C', r'°F', r'K',
             # ESG
             r'tCO2e?', r'MWh', r'GWh', r'GJ', r'TJ',
             # General
@@ -447,7 +447,7 @@ class EnterpriseTableExtractor:
         try:
             with pdfplumber.open(self.pdf_path) as pdf:
                 self.extraction_stats['total_pages'] = len(pdf.pages)
-                logger.info(f"Initialized PDF: {self.pdf_path.name} "
+                logger.info(f"[DIAGNOSTICS] Initialized PDF: {self.pdf_path.name} "
                           f"({self.extraction_stats['total_pages']} pages)")
         except Exception as e:
             logger.error(f"Failed to open PDF: {e}")
@@ -499,8 +499,18 @@ class EnterpriseTableExtractor:
         """Main extraction method with parallel processing - TESTING VERSION"""
         start_time = datetime.now()
         
-        logger.info(f"Starting parallel extraction with {self.max_workers} workers")
-        logger.info(f"Processing {self.extraction_stats['total_pages']} pages")
+        # TESTING DIAGNOSTICS AND LIMITERS
+        logger.info(f"[DIAGNOSTICS] TESTING_TABLE_LIMIT env var: {os.environ.get('TESTING_TABLE_LIMIT', 'NOT SET')}")
+        logger.info(f"[DIAGNOSTICS] Parsed testing_table_limit: {self.testing_table_limit}")
+        
+        if self.testing_table_limit > 0:
+            logger.info(f"[TESTING MODE] Will stop after extracting {self.testing_table_limit} tables")
+            self._should_stop_extraction = False
+        else:
+            logger.info(f"[PRODUCTION MODE] No testing limit set - will process all tables")
+        
+        logger.info(f"[DIAGNOSTICS] Starting parallel extraction with {self.max_workers} workers")
+        logger.info(f"[DIAGNOSTICS] Processing {self.extraction_stats['total_pages']} pages")
         logger.info(f"Quality filter: {'ENABLED' if self.enforce_quality_filter else 'DISABLED'}")
         
         # Determine pages to process
@@ -535,21 +545,25 @@ class EnterpriseTableExtractor:
                 # Progress update
                 if processed_pages % 10 == 0 or processed_pages == total_pages:
                     progress = (processed_pages / total_pages) * 100
-                    logger.info(f"Progress: {processed_pages}/{total_pages} pages ({progress:.1f}%)")
+                    logger.info(f"[DIAGNOSTICS] Progress: {processed_pages}/{total_pages} pages ({progress:.1f}%)")
                 
                 try:
                     page_tables = future.result()
                     if page_tables:
                         self.extraction_stats['pages_with_tables'] += 1
+                        logger.info(f"[DIAGNOSTICS] Page {page_num} found {len(page_tables)} tables")
                         for table_info in page_tables:
                             self._save_table(table_info)
                             
                             # TESTING ONLY - Check if we should stop
                             if self._should_stop_extraction:
+                                logger.info(f"[TESTING MODE] Breaking from table processing loop")
                                 break
                         
                         if self._should_stop_extraction:
                             break
+                    else:
+                        logger.debug(f"[DIAGNOSTICS] Page {page_num} found no tables")
                             
                 except Exception as e:
                     logger.error(f"Failed to process page {page_num}: {e}")
@@ -576,7 +590,7 @@ class EnterpriseTableExtractor:
         if self.save_metadata:
             self._save_extraction_metadata()
         
-        logger.info(f"Extraction complete: {len(self.extracted_tables)} tables extracted in {self.extraction_stats['total_extraction_time']:.1f}s")
+        logger.info(f"[DIAGNOSTICS] Extraction complete: {len(self.extracted_tables)} tables extracted in {self.extraction_stats['total_extraction_time']:.1f}s")
         if self.enforce_quality_filter and self.extraction_stats['tables_filtered_by_quality'] > 0:
             logger.info(f"Tables filtered by quality: {self.extraction_stats['tables_filtered_by_quality']}")
         
@@ -598,9 +612,10 @@ class EnterpriseTableExtractor:
         
         # TESTING ONLY - Check early exit
         if self._should_stop_extraction:
+            logger.info(f"[TESTING MODE] Skipping page {page_num} due to early exit")
             return []
             
-        logger.debug(f"Processing page {page_num}")
+        logger.debug(f"[DIAGNOSTICS] Processing page {page_num}")
         
         all_tables = []
         
@@ -617,6 +632,7 @@ class EnterpriseTableExtractor:
             
             # TESTING ONLY - Check early exit before each method
             if self._should_stop_extraction:
+                logger.info(f"[TESTING MODE] Breaking from extraction method {method_name} on page {page_num}")
                 break
                 
             try:
@@ -640,7 +656,7 @@ class EnterpriseTableExtractor:
                         # Apply quality filter ONLY if enforce_quality_filter is True
                         if self.enforce_quality_filter and quality_score < self.min_quality_score:
                             self.extraction_stats['tables_filtered_by_quality'] += 1
-                            logger.debug(f"Filtered table on page {page_num} with quality score {quality_score:.2f}")
+                            logger.debug(f"[DIAGNOSTICS] Filtered table on page {page_num} with quality score {quality_score:.2f}")
                             continue
                         
                         # Classify table
@@ -662,6 +678,7 @@ class EnterpriseTableExtractor:
                         }
                         
                         all_tables.append(table_info)
+                        logger.info(f"[DIAGNOSTICS] Page {page_num} found valid table via {method_name}: {table_type}, quality {quality_score:.2f}")
                         
                         # Update statistics
                         with self._tables_lock:
@@ -677,6 +694,7 @@ class EnterpriseTableExtractor:
         # Remove duplicates
         all_tables = self._remove_duplicate_tables(all_tables)
         
+        logger.debug(f"[DIAGNOSTICS] Page {page_num} total unique tables: {len(all_tables)}")
         return all_tables
     
     def _extract_with_pdfplumber(self, page_num: int) -> List[List[List[Any]]]:
@@ -863,7 +881,7 @@ class EnterpriseTableExtractor:
                 seen_hashes.add(table_hash)
                 unique_tables.append(table)
             else:
-                logger.debug(f"Removed duplicate table on page {table['page']}")
+                logger.debug(f"[DIAGNOSTICS] Removed duplicate table on page {table['page']}")
         
         return unique_tables
     
@@ -871,11 +889,15 @@ class EnterpriseTableExtractor:
         """Save table to CSV file with atomic write - TESTING VERSION"""
         
         # TESTING ONLY - Check if we should stop before saving
-        if self.testing_table_limit > 0 and len(self.extracted_tables) >= self.testing_table_limit:
-            logger.info(f"[TESTING MODE] Reached limit of {self.testing_table_limit} tables - stopping extraction")
-            self._should_stop_extraction = True
-            self.extraction_stats['testing_limit_reached'] = True
-            return  # Skip saving this table
+        if self.testing_table_limit > 0:
+            current_count = len(self.extracted_tables)
+            logger.info(f"[TESTING DIAGNOSTICS] Current table count: {current_count}, Limit: {self.testing_table_limit}")
+            
+            if current_count >= self.testing_table_limit:
+                logger.info(f"[TESTING MODE] Reached limit of {self.testing_table_limit} tables - stopping extraction")
+                self._should_stop_extraction = True
+                self.extraction_stats['testing_limit_reached'] = True
+                return  # Skip saving this table
         
         page_num = table_info['page']
         # Use the pre-calculated index from table_info
@@ -945,7 +967,7 @@ class EnterpriseTableExtractor:
                 
                 self.extraction_stats['table_types_found'][metadata.table_type] += 1
             
-            logger.debug(f"Saved {filename} - Type: {metadata.table_type}, "
+            logger.info(f"[DIAGNOSTICS] Saved {filename} - Type: {metadata.table_type}, "
                        f"Quality: {metadata.quality_score:.2f}, "
                        f"Rows: {metadata.rows}, Cols: {metadata.columns}")
             
