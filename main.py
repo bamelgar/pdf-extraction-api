@@ -1,3 +1,16 @@
+"""
+PDF Extraction API - TESTING VERSION with Supabase Integration
+===============================================================
+CHANGES IN THIS VERSION:
+1. SKIPS TABLE EXTRACTION ENTIRELY (commented out but preserved)
+2. Uploads images to Supabase during extraction
+3. Returns URLs instead of base64 when Supabase succeeds
+4. Testing limiters active (currently 5, change to 12 via env vars)
+5. Fallback to base64 if Supabase fails
+
+TO ENABLE TABLES AGAIN: Uncomment the table extraction sections in /extract/all
+"""
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
@@ -12,13 +25,15 @@ import subprocess
 import sys
 from datetime import datetime
 import logging
+import requests
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
-app = FastAPI(title="PDF Extraction API - TESTING VERSION", version="1.0.0-testing")
+app = FastAPI(title="PDF Extraction API - TESTING VERSION with Supabase", version="1.0.0-testing-supabase")
 
 # Add CORS middleware for n8n
 app.add_middleware(
@@ -32,6 +47,49 @@ app.add_middleware(
 # Simple auth
 security = HTTPBearer()
 API_KEY = os.environ.get("API_KEY", "your-secret-api-key-change-this")
+
+# Supabase configuration - using environment variables for security
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_TOKEN = os.environ.get("SUPABASE_TOKEN") 
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "public-images")
+
+def upload_image_to_supabase(image_path: Path, filename: str) -> str:
+    """Upload image to Supabase Storage and return public URL"""
+    if not SUPABASE_URL or not SUPABASE_TOKEN:
+        logger.warning("Supabase not configured - skipping upload")
+        return None
+    
+    try:
+        # Read image data
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        
+        # Upload URL
+        upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+        
+        # Headers
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_TOKEN}",
+            "Content-Type": "image/png",
+            "x-upsert": "true",
+            "Cache-Control": "public, max-age=3600, immutable"
+        }
+        
+        # Upload to Supabase
+        response = requests.put(upload_url, data=image_data, headers=headers, timeout=30)
+        
+        if response.status_code in [200, 201]:
+            # Return public URL
+            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+            logger.info(f"✅ Uploaded {filename} to Supabase")
+            return public_url
+        else:
+            logger.error(f"❌ Failed to upload {filename}: {response.status_code} - {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error uploading {filename}: {e}")
+        return None
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     if credentials.credentials != API_KEY:
@@ -67,13 +125,15 @@ async def health_check():
         "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
         "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
-        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set")
+        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set"),
+        "SUPABASE_CONFIGURED": "YES" if (SUPABASE_URL and SUPABASE_TOKEN) else "NO",
+        "TABLES_SKIPPED": "YES - Temporarily disabled for testing"
     }
     
     return {
-        "status": "healthy - TESTING MODE",
+        "status": "healthy - TESTING MODE with Supabase (TABLES SKIPPED)",
         "service": "PDF Extraction API - TESTING VERSION",
-        "version": "1.0.0-testing",
+        "version": "1.0.0-testing-supabase-no-tables",
         "timestamp": datetime.now().isoformat(),
         "testing_limits": testing_indicators
     }
@@ -88,249 +148,9 @@ async def test_extraction(
         "success": True,
         "filename": file.filename,
         "content_type": file.content_type,
-        "message": "File received successfully - TESTING MODE"
+        "message": "File received successfully - TESTING MODE",
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN)
     }
-
-@app.post("/extract/tables")
-async def extract_tables(
-    file: UploadFile = File(...),
-    min_quality: float = 0.3,
-    workers: int = 4,
-    # TESTING LIMITER (optional)
-    limit_tables: Optional[int] = None,
-    token: str = Depends(verify_token)
-):
-    """Extract tables from PDF using the enterprise extractor"""
-    temp_dir = tempfile.mkdtemp()
-
-    # Resolve temp limit
-    eff_limit_tables = _limit_from(limit_tables, "TEMP_LIMIT_TABLES")
-    if eff_limit_tables:
-        logger.info(f"[TESTING LIMIT] Tables will be limited to first {eff_limit_tables} items (packaging only).")
-
-    try:
-        # Save uploaded file
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        # Create output directory
-        output_dir = os.path.join(temp_dir, "tables")
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Run the extraction script - CORRECT FILENAME
-        cmd = [
-            sys.executable,
-            "enterprise_table_extractor_full.py",
-            pdf_path,
-            "--output-dir", output_dir,
-            "--workers", str(workers),
-            "--min-quality", str(min_quality),
-            "--clear-output"
-        ]
-        logger.info(f"Running command: {' '.join(cmd)}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Extraction failed: {result.stderr}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Extraction failed: {result.stderr}"
-            )
-
-        # Read the metadata file
-        metadata_path = os.path.join(output_dir, "extraction_metadata.json")
-        if not os.path.exists(metadata_path):
-            raise HTTPException(
-                status_code=500,
-                detail="No metadata file generated"
-            )
-
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-
-        # Process each table (apply TESTING limit to packaging only)
-        tables = []
-        table_list = metadata.get('tables', [])
-        if eff_limit_tables is not None:
-            table_list = table_list[:eff_limit_tables]
-
-        for table_info in table_list:
-            csv_path = os.path.join(output_dir, table_info['filename'])
-
-            if os.path.exists(csv_path):
-                # Read CSV content
-                with open(csv_path, 'r', encoding='utf-8') as f:
-                    csv_content = f.read()
-
-                # Read as base64
-                with open(csv_path, 'rb') as f:
-                    csv_base64 = base64.b64encode(f.read()).decode('utf-8')
-
-                tables.append({
-                    'filename': table_info['filename'],
-                    'page_number': table_info['page_number'],
-                    'table_index': table_info['table_index'],
-                    'table_type': table_info['table_type'],
-                    'quality_score': table_info['quality_score'],
-                    'rows': table_info['rows'],
-                    'columns': table_info['columns'],
-                    'csv_content': csv_content,
-                    'csv_base64': csv_base64,
-                    'metadata': table_info.get('metadata', {})
-                })
-
-        return {
-            'success': True,
-            'tables_count': len(tables),
-            'tables': tables,
-            'statistics': metadata.get('statistics', {}),
-            'testing_mode': True
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail="Extraction timed out after 5 minutes"
-        )
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-@app.post("/extract/images")
-async def extract_images(
-    file: UploadFile = File(...),
-    min_quality: float = 0.3,
-    min_width: int = 100,
-    min_height: int = 100,
-    workers: int = 4,
-    # TESTING LIMITER (optional)
-    limit_images: Optional[int] = None,
-    token: str = Depends(verify_token)
-):
-    """Extract images from PDF using the enterprise extractor"""
-    temp_dir = tempfile.mkdtemp()
-
-    # Resolve temp limit
-    eff_limit_images = _limit_from(limit_images, "TEMP_LIMIT_IMAGES")
-    if eff_limit_images:
-        logger.info(f"[TESTING LIMIT] Images will be limited to first {eff_limit_images} items (packaging only).")
-
-    try:
-        # Save uploaded file
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        # Create output directory
-        output_dir = os.path.join(temp_dir, "images")
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Run the extraction script - CORRECT FILENAME
-        cmd = [
-            sys.executable,
-            "enterprise_image_extractor.py",
-            pdf_path,
-            "--output-dir", output_dir,
-            "--workers", str(workers),
-            "--min-quality", str(min_quality),
-            "--min-width", str(min_width),
-            "--min-height", str(min_height),
-            "--clear-output"
-        ]
-        logger.info(f"Running command: {' '.join(cmd)}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Extraction failed: {result.stderr}")
-            # Don't fail completely, log the error
-            logger.warning("Continuing despite extraction errors")
-
-        # Read the metadata file if it exists
-        metadata_path = os.path.join(output_dir, "extraction_metadata.json")
-        metadata = {}
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-
-        # Process each image (apply TESTING limit to packaging only)
-        images = []
-        image_files = [f for f in os.listdir(output_dir) if f.endswith('.png')]
-        image_files.sort()  # deterministic order
-
-        if eff_limit_images is not None:
-            image_files = image_files[:eff_limit_images]
-
-        for img_file in image_files:
-            img_path = os.path.join(output_dir, img_file)
-
-            # Read image as base64 (unchanged contract)
-            with open(img_path, 'rb') as f:
-                img_base64 = base64.b64encode(f.read()).decode('utf-8')
-
-            # Find metadata for this image
-            img_metadata = {}
-            for img_info in metadata.get('images', []):
-                if img_info.get('filename') == img_file:
-                    img_metadata = img_info
-                    break
-
-            images.append({
-                'filename': img_file,
-                'page_number': img_metadata.get('page_number', 0),
-                'image_index': img_metadata.get('image_index', 0),
-                'image_type': img_metadata.get('image_type', 'unknown'),
-                'quality_score': img_metadata.get('quality_score', 0.5),
-                'width': img_metadata.get('width', 0),
-                'height': img_metadata.get('height', 0),
-                'has_text': img_metadata.get('has_text', False),
-                'text_content': img_metadata.get('text_content', ''),
-                'image_base64': img_base64,
-                'metadata': img_metadata
-            })
-
-        return {
-            'success': True,
-            'images_count': len(images),
-            'images': images,
-            'statistics': metadata.get('statistics', {}),
-            'testing_mode': True
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail="Extraction timed out after 5 minutes"
-        )
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Extraction error: {str(e)}"
-        )
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
 @app.post("/extract/all")
 async def extract_all(
@@ -344,7 +164,7 @@ async def extract_all(
     limit_images: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
-    """Extract both tables and images from PDF - TESTING VERSION"""
+    """Extract both tables and images from PDF - TESTING VERSION WITH SUPABASE (TABLES TEMPORARILY DISABLED)"""
     temp_dir = tempfile.mkdtemp()
 
     # Resolve temp limits
@@ -373,7 +193,14 @@ async def extract_all(
 
         all_results = []
 
-        # Extract tables - CORRECT FILENAME
+        # ============================================
+        # TABLE EXTRACTION - TEMPORARILY DISABLED
+        # ============================================
+        logger.info("📋 TABLE EXTRACTION: SKIPPED (Temporarily disabled for testing)")
+        logger.info("Tables will be added back once image pipeline is fully working")
+        
+        """
+        # PRESERVED TABLE EXTRACTION CODE - UNCOMMENT TO RE-ENABLE
         logger.info("Extracting tables...")
         table_cmd = [
             sys.executable,
@@ -452,9 +279,12 @@ async def extract_all(
             logger.error("Table extraction timed out")
         except Exception as e:
             logger.error(f"Table extraction error: {e}", exc_info=True)
+        """
 
-        # Extract images - CORRECT FILENAME
-        logger.info("Extracting images...")
+        # ============================================
+        # IMAGE EXTRACTION - WITH SUPABASE UPLOAD
+        # ============================================
+        logger.info("🖼️ Extracting images...")
         image_cmd = [
             sys.executable,
             "enterprise_image_extractor.py",
@@ -488,6 +318,7 @@ async def extract_all(
                 image_files.sort()
                 if eff_limit_images is not None:
                     image_files = image_files[:eff_limit_images]
+                    logger.info(f"Limiting to {eff_limit_images} images for testing")
 
                 # Read image metadata
                 image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
@@ -508,9 +339,12 @@ async def extract_all(
                 for img_file in image_files:
                     img_path = os.path.join(images_dir, img_file)
 
-                    # Read image as base64
-                    with open(img_path, 'rb') as f:
-                        img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                    # Create unique filename with timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_filename = f"{timestamp}_{img_file}"
+                    
+                    # Try to upload to Supabase
+                    supabase_url = upload_image_to_supabase(Path(img_path), unique_filename)
 
                     # Attach metadata if present
                     info = meta_map.get(img_file, {})
@@ -532,10 +366,20 @@ async def extract_all(
                         "visual_elements": info.get('visual_elements', {}),
                         "vector_count": info.get('vector_count'),
                         "enhancement_applied": info.get('enhancement_applied', False),
-                        "mimeType": "image/png",
-                        # keep image payload inline for downstream (original behavior)
-                        "base64_content": img_base64
+                        "mimeType": "image/png"
                     }
+                    
+                    if supabase_url:
+                        # Supabase upload successful
+                        result_item['supabase_url'] = supabase_url
+                        result_item['uploaded_filename'] = unique_filename
+                        logger.info(f"✅ Image {img_file} uploaded to Supabase")
+                    else:
+                        # Fallback to base64
+                        with open(img_path, 'rb') as f:
+                            img_base64 = base64.b64encode(f.read()).decode('utf-8')
+                        result_item['base64_content'] = img_base64  # Fixed field name
+                        logger.info(f"⚠️ Image {img_file} using base64 fallback")
 
                     all_results.append(result_item)
             else:
@@ -548,7 +392,7 @@ async def extract_all(
 
         # Sort results by page and index (like the original script)
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
-        logger.info(f"Total results: {len(all_results)} items")
+        logger.info(f"Total results: {len(all_results)} items (0 tables, {len(all_results)} images)")
 
         # Return wrapped response to prevent n8n from unwrapping single-item arrays
         return {
@@ -556,7 +400,9 @@ async def extract_all(
             "count": len(all_results),
             "extraction_timestamp": datetime.now().isoformat(),
             "success": True,
-            "testing_mode": True
+            "testing_mode": True,
+            "supabase_enabled": bool(SUPABASE_URL and SUPABASE_TOKEN),
+            "tables_skipped": True
         }
 
     except Exception as e:
@@ -586,7 +432,7 @@ async def check_environment():
     # Check for required packages
     required_packages = [
         "pdfplumber", "pandas", "numpy", "camelot-py",
-        "tabula-py", "PyMuPDF", "PIL", "cv2", "pytesseract"
+        "tabula-py", "PyMuPDF", "PIL", "cv2", "pytesseract", "requests"
     ]
 
     for package in required_packages:
@@ -637,7 +483,16 @@ async def check_environment():
         "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
         "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
-        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set")
+        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set"),
+        "TABLES_EXTRACTION": "DISABLED FOR TESTING"
+    }
+    
+    # SUPABASE STATUS
+    checks["supabase_status"] = {
+        "SUPABASE_URL": "configured" if SUPABASE_URL else "not set",
+        "SUPABASE_TOKEN": "configured" if SUPABASE_TOKEN else "not set",
+        "SUPABASE_BUCKET": SUPABASE_BUCKET,
+        "ready_for_upload": bool(SUPABASE_URL and SUPABASE_TOKEN)
     }
 
     return checks
@@ -646,10 +501,12 @@ async def check_environment():
 async def test_endpoint():
     """Simple test endpoint that doesn't require auth"""
     return {
-        "message": "API is working! - TESTING MODE",
+        "message": "API is working! - TESTING MODE with Supabase (Tables Disabled)",
         "timestamp": datetime.now().isoformat(),
         "python_version": sys.version,
-        "testing_mode": True
+        "testing_mode": True,
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN),
+        "tables_disabled": True
     }
 
 if __name__ == "__main__":
