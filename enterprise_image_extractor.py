@@ -1,809 +1,1155 @@
 #!/usr/bin/env python3
 """
-Enterprise Image Extractor v3.5
-- Advanced extraction of images, charts, and diagrams from PDFs
-- Multi-process parallel extraction for performance
-- Context-aware image processing with OCR and quality metrics
-- Comprehensive metadata generation
-- Properly handles both bitmap and vector images
+Enterprise PDF Image Extractor v1.0+ (Enhanced)
+- Parallel processing with ThreadPoolExecutor
+- Atomic file writes for images
+- Comprehensive file verification
+- Thread-safe operations
+- Progress tracking
 """
 
 import os
 import sys
 import json
-import time
-import argparse
-import concurrent.futures
-import traceback
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Set
 import logging
-import shutil
-import uuid
+import hashlib
 import re
+import tempfile
+import shutil
+import threading
+import concurrent.futures
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('ImageExtractor')
+# Core libraries
+import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
+import fitz  # PyMuPDF
+from io import BytesIO
 
-# Import specialized extraction libraries
+# Try importing optional libraries
 try:
-    import numpy as np
-    from PIL import Image, ImageEnhance, ImageFilter
-    import fitz  # PyMuPDF
     import cv2
-    from pdf2image import convert_from_path
-    import pytesseract
-except ImportError as e:
-    logger.error(f"Missing dependency: {e}")
-    logger.error("Please install required packages: pip install pymupdf pdf2image pytesseract opencv-python-headless pillow numpy")
-    sys.exit(1)
-
-# Try to load optional dependencies
-try:
-    from pdfminer.high_level import extract_pages
-    from pdfminer.layout import LTFigure, LTImage
-    has_pdfminer = True
+    HAS_OPENCV = True
 except ImportError:
-    logger.warning("pdfminer.six not installed, some extraction methods will be unavailable")
-    has_pdfminer = False
+    HAS_OPENCV = False
+    print("OpenCV not available, some features limited")
 
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+    print("Tesseract not available, OCR disabled")
 
-class ImageExtractor:
-    """Enterprise PDF image extraction with multi-method approach"""
-    
-    def __init__(self, 
-                 pdf_path: str, 
-                 output_dir: str,
-                 min_width: int = 100,
-                 min_height: int = 100,
-                 min_quality: float = 0.4,
-                 dpi: int = 300,
-                 max_workers: int = 4,
-                 vector_threshold: int = 10,
-                 extract_text: bool = True,
-                 enhance_images: bool = True,
-                 clear_output: bool = False):
-        """
-        Initialize the image extractor
-        
-        Args:
-            pdf_path: Path to the PDF file
-            output_dir: Directory to save extracted images
-            min_width: Minimum image width to extract
-            min_height: Minimum image height to extract
-            min_quality: Minimum image quality score (0-1)
-            dpi: DPI for PDF rendering
-            max_workers: Maximum number of worker processes
-            vector_threshold: Minimum vector elements to classify as vector
-            extract_text: Whether to extract text from images
-            enhance_images: Whether to enhance image quality
-            clear_output: Whether to clear output directory before extraction
-        """
-        self.pdf_path = pdf_path
-        self.output_dir = output_dir
-        self.min_width = min_width
-        self.min_height = min_height
-        self.min_quality = min_quality
-        self.dpi = dpi
-        self.max_workers = max_workers
-        self.vector_threshold = vector_threshold
-        self.extract_text = extract_text
-        self.enhance_images = enhance_images
-        self.clear_output = clear_output
-        
-        # Initialize state
-        self.extracted_images = []
-        self.pages_total = 0
-        self.start_time = time.time()
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        # Clear output directory if requested
-        if self.clear_output:
-            for f in os.listdir(self.output_dir):
-                if f.endswith('.png') or f.endswith('.json'):
-                    os.remove(os.path.join(self.output_dir, f))
-            
-        # Verify PDF exists
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-            
-        logger.info(f"Initialized image extractor for {pdf_path}")
-        logger.info(f"Output directory: {output_dir}")
-        logger.info(f"Min dimensions: {min_width}x{min_height}, Quality: {min_quality}, Workers: {max_workers}")
+try:
+    import easyocr
+    HAS_EASYOCR = True
+    reader = easyocr.Reader(['en'])
+except ImportError:
+    HAS_EASYOCR = False
+    print("EasyOCR not available")
 
-    def _extract_pymupdf(self) -> List[Dict[str, Any]]:
-        """Extract images using PyMuPDF (main extraction method)"""
-        images = []
-        
-        try:
-            pdf_document = fitz.open(self.pdf_path)
-            self.pages_total = len(pdf_document)
-            
-            for page_index in range(len(pdf_document)):
-                page = pdf_document[page_index]
-                page_number = page_index + 1
-                
-                # Get page dimensions
-                page_width, page_height = page.rect.width, page.rect.height
-                
-                # Process images on this page
-                image_list = page.get_images(full=True)
-                
-                # Track images for this page
-                page_images = []
-                
-                for img_index, img_info in enumerate(image_list):
-                    try:
-                        xref = img_info[0]
-                        base_image = pdf_document.extract_image(xref)
-                        
-                        if not base_image:
-                            continue
-                            
-                        image_bytes = base_image["image"]
-                        image_ext = base_image["ext"]
-                        
-                        # Convert to PIL Image for processing
-                        try:
-                            from io import BytesIO
-                            pil_image = Image.open(BytesIO(image_bytes))
-                        except Exception as e:
-                            logger.warning(f"Failed to open image on page {page_number}: {e}")
-                            continue
-                            
-                        # Check dimensions
-                        width, height = pil_image.size
-                        if width < self.min_width or height < self.min_height:
-                            continue
-                            
-                        # Get image position on page
-                        bbox = None
-                        for img_obj in page.get_images(full=True):
-                            if img_obj[0] == xref:
-                                # Get all instances of this image on the page
-                                instances = page.get_image_rects(img_obj)
-                                if instances:
-                                    # Use the first instance's bbox
-                                    bbox = instances[0]
-                                    break
-                                    
-                        # Compute relative position
-                        position = {}
-                        if bbox:
-                            position = {
-                                "x1": bbox.x0 / page_width,
-                                "y1": bbox.y0 / page_height,
-                                "x2": bbox.x2 / page_width,
-                                "y2": bbox.y2 / page_height,
-                                "width": bbox.width / page_width,
-                                "height": bbox.height / page_height,
-                                "area": (bbox.width * bbox.height) / (page_width * page_height)
-                            }
-                            
-                        # Generate unique filename
-                        timestamp = int(time.time() * 1000)
-                        filename = f"img_p{page_number:03d}_i{img_index+1:03d}_{timestamp}.png"
-                        filepath = os.path.join(self.output_dir, filename)
-                        
-                        # Save the image
-                        pil_image.save(filepath, "PNG")
-                        
-                        # Compute image quality metrics
-                        quality_score = self._compute_image_quality(pil_image)
-                        
-                        # Only process images that meet quality threshold
-                        if quality_score < self.min_quality:
-                            if os.path.exists(filepath):
-                                os.remove(filepath)
-                            continue
-                            
-                        # Extract text from image if enabled
-                        text_content = ""
-                        has_text = False
-                        if self.extract_text:
-                            text_content = self._extract_text_from_image(pil_image)
-                            has_text = bool(text_content.strip())
-                            
-                        # Categorize image type
-                        image_type = self._categorize_image(pil_image, text_content)
-                        
-                        # Enhance image if enabled
-                        enhancement_applied = False
-                        if self.enhance_images and image_type != "photo":
-                            try:
-                                enhanced = self._enhance_image(pil_image)
-                                enhanced.save(filepath, "PNG")
-                                enhancement_applied = True
-                            except Exception as e:
-                                logger.warning(f"Image enhancement failed: {e}")
-                        
-                        # Gather metadata
-                        image_info = {
-                            "page_number": page_number,
-                            "image_index": img_index + 1,
-                            "filename": filename,
-                            "filepath": filepath,
-                            "width": width,
-                            "height": height,
-                            "position": position,
-                            "image_type": image_type,
-                            "quality_score": quality_score,
-                            "has_text": has_text,
-                            "text_content": text_content,
-                            "extraction_method": "pymupdf",
-                            "enhancement_applied": enhancement_applied,
-                            "vector_elements": 0,  # Not a vector image
-                            "size_bytes": os.path.getsize(filepath)
-                        }
-                        
-                        page_images.append(image_info)
-                        
-                    except Exception as e:
-                        logger.error(f"Error extracting image {img_index+1} on page {page_number}: {e}")
-                        traceback.print_exc()
-                
-                # Check if we also have vector graphics on this page
-                vector_images = self._extract_vector_graphics(page, page_number)
-                page_images.extend(vector_images)
-                
-                # Add all valid images from this page
-                images.extend(page_images)
-                    
-            pdf_document.close()
-            
-        except Exception as e:
-            logger.error(f"PyMuPDF extraction failed: {e}")
-            traceback.print_exc()
-            
-        return images
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-    def _extract_vector_graphics(self, page: fitz.Page, page_number: int) -> List[Dict[str, Any]]:
-        """Extract vector graphics from the page"""
-        vector_images = []
-        
-        try:
-            # Render the page to an image at high DPI
-            pix = page.get_pixmap(matrix=fitz.Matrix(self.dpi/72, self.dpi/72))
-            
-            # Convert to PIL image
-            from io import BytesIO
-            img_data = pix.tobytes("png")
-            page_image = Image.open(BytesIO(img_data))
-            
-            # Get page dimensions
-            page_width, page_height = page.rect.width, page.rect.height
-            
-            # Get all paths, shapes, and vector elements
-            paths = page.get_drawings()
-            
-            if len(paths) >= self.vector_threshold:
-                # Likely has vector graphics, save the rendered page
-                timestamp = int(time.time() * 1000)
-                filename = f"vector_p{page_number:03d}_{timestamp}.png"
-                filepath = os.path.join(self.output_dir, filename)
-                
-                page_image.save(filepath, "PNG")
-                
-                # Extract text content near vector graphics
-                text_content = self._extract_text_from_image(page_image)
-                has_text = bool(text_content.strip())
-                
-                # Compute image quality metrics
-                quality_score = self._compute_image_quality(page_image)
-                
-                # Categorize image type (likely chart or diagram)
-                image_type = self._categorize_image(page_image, text_content)
-                if "vector" not in image_type:
-                    image_type = f"vector_{image_type}"
-                
-                # Gather metadata
-                image_info = {
-                    "page_number": page_number,
-                    "image_index": 0,  # Special index for full page vector
-                    "filename": filename,
-                    "filepath": filepath,
-                    "width": page_image.width,
-                    "height": page_image.height,
-                    "position": {
-                        "x1": 0, "y1": 0, "x2": 1, "y2": 1,
-                        "width": 1, "height": 1, "area": 1
-                    },
-                    "image_type": image_type,
-                    "quality_score": quality_score,
-                    "has_text": has_text,
-                    "text_content": text_content,
-                    "extraction_method": "vector_render",
-                    "enhancement_applied": False,
-                    "vector_elements": len(paths),
-                    "size_bytes": os.path.getsize(filepath)
-                }
-                
-                vector_images.append(image_info)
-                
-        except Exception as e:
-            logger.error(f"Vector graphics extraction failed on page {page_number}: {e}")
-            traceback.print_exc()
-            
-        return vector_images
-        
-    def _extract_embedded_images(self) -> List[Dict[str, Any]]:
-        """Extract images using PDF2Image (backup method)"""
-        images = []
-        
-        try:
-            # Convert PDF pages to images
-            pages = convert_from_path(self.pdf_path, dpi=self.dpi)
-            
-            for page_index, page_image in enumerate(pages):
-                page_number = page_index + 1
-                
-                # Process this page image
-                width, height = page_image.size
-                
-                # Generate unique filename
-                timestamp = int(time.time() * 1000)
-                filename = f"embedded_p{page_number:03d}_{timestamp}.png"
-                filepath = os.path.join(self.output_dir, filename)
-                
-                # Save the image
-                page_image.save(filepath, "PNG")
-                
-                # Compute image quality metrics
-                quality_score = self._compute_image_quality(page_image)
-                
-                # Extract text from image if enabled
-                text_content = ""
-                has_text = False
-                if self.extract_text:
-                    text_content = self._extract_text_from_image(page_image)
-                    has_text = bool(text_content.strip())
-                    
-                # Categorize image type
-                image_type = self._categorize_image(page_image, text_content)
-                
-                # Gather metadata
-                image_info = {
-                    "page_number": page_number,
-                    "image_index": 0,  # Special index for embedded image
-                    "filename": filename,
-                    "filepath": filepath,
-                    "width": width,
-                    "height": height,
-                    "position": {
-                        "x1": 0, "y1": 0, "x2": 1, "y2": 1,
-                        "width": 1, "height": 1, "area": 1
-                    },
-                    "image_type": image_type,
-                    "quality_score": quality_score,
-                    "has_text": has_text,
-                    "text_content": text_content,
-                    "extraction_method": "embedded",
-                    "enhancement_applied": False,
-                    "vector_elements": 0,
-                    "size_bytes": os.path.getsize(filepath)
-                }
-                
-                images.append(image_info)
-                
-        except Exception as e:
-            logger.error(f"PDF2Image extraction failed: {e}")
-            traceback.print_exc()
-            
-        return images
+@dataclass
+class ImageMetadata:
+    """Metadata for extracted images"""
+    filename: str
+    page_number: int
+    image_index: int
+    image_type: str
+    extraction_method: str  # 'embedded' or 'vector_render'
+    width: int
+    height: int
+    quality_score: float
+    has_text: bool
+    text_content: str
+    visual_elements: Dict[str, Any]
+    extraction_timestamp: str
+    file_size: int
+    dpi: int
+    color_mode: str
+    enhancement_applied: bool
+    context: Dict[str, Any]
+    vector_count: Optional[int] = None
+
+class ImageClassifier:
+    """Classify images by content type"""
     
-    def _compute_image_quality(self, img: Image.Image) -> float:
-        """Compute image quality score based on various metrics"""
-        try:
-            # Convert to grayscale for analysis
-            gray = img.convert('L')
-            
-            # Get image dimensions
-            width, height = img.size
-            
-            # Calculate metrics
-            aspect_ratio = width / height if height > 0 else 0
-            size_score = min(1.0, (width * height) / (1000 * 1000))
-            
-            # Check if image is not just white/black
-            pixels = np.array(gray)
-            std_dev = np.std(pixels)
-            contrast_score = min(1.0, std_dev / 50)
-            
-            # Calculate average quality score
-            quality_score = (size_score + contrast_score) / 2
-            
-            return quality_score
-            
-        except Exception as e:
-            logger.warning(f"Quality computation failed: {e}")
-            return 0.5  # Default middle quality
-    
-    def _extract_text_from_image(self, img: Image.Image) -> str:
-        """Extract text from image using OCR"""
-        try:
-            # Use pytesseract to extract text
-            text = pytesseract.image_to_string(img)
-            return text.strip()
-        except Exception as e:
-            logger.warning(f"Text extraction failed: {e}")
-            return ""
-    
-    def _categorize_image(self, img: Image.Image, text_content: str) -> str:
-        """Categorize image type based on content and text"""
-        try:
-            # Convert to numpy array for analysis
-            img_array = np.array(img)
-            
-            # Check image dimensions
-            height, width = img_array.shape[:2]
-            
-            # Check if image contains a face
-            try:
-                # Use OpenCV's face detection
-                face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-                faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                if len(faces) > 0:
-                    return "portrait"
-            except:
-                pass
-            
-            # Check if image is likely a chart/graph
-            chart_keywords = ['chart', 'graph', 'figure', 'fig', 'plot', 'axis', 'trend', 
-                             'bar', 'pie', 'line', 'scatter', 'series', 'data', 'statistics']
-            
-            text_lower = text_content.lower()
-            chart_score = sum(1 for keyword in chart_keywords if keyword in text_lower)
-            
-            if chart_score >= 2:
-                return "chart"
-                
-            # Check if image is likely a diagram
-            diagram_keywords = ['diagram', 'flow', 'process', 'architecture', 'model', 
-                              'system', 'framework', 'structure', 'network', 'map']
-            
-            diagram_score = sum(1 for keyword in diagram_keywords if keyword in text_lower)
-            
-            if diagram_score >= 2:
-                return "diagram"
-                
-            # Check if image is likely a table
-            table_keywords = ['table', 'column', 'row', 'cell', 'grid', 'data', 'value']
-            
-            table_score = sum(1 for keyword in table_keywords if keyword in text_lower)
-            
-            if table_score >= 2:
-                return "table"
-            
-            # Default to general image type
-            return "general_image"
-            
-        except Exception as e:
-            logger.warning(f"Image categorization failed: {e}")
-            return "general_image"
-    
-    def _enhance_image(self, img: Image.Image) -> Image.Image:
-        """Enhance image quality"""
-        try:
-            # Convert to RGB if needed
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-                
-            # Apply enhancements
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.2)
-            
-            enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(1.3)
-            
-            return img
-            
-        except Exception as e:
-            logger.warning(f"Image enhancement failed: {e}")
-            return img
-            
-    def _extract_page_images(self, page_number: int) -> List[Dict[str, Any]]:
-        """Extract images from a single page using multiple methods"""
-        images = []
+    @staticmethod
+    def classify_image(image: Image.Image, text_content: str = "", vector_count: int = 0) -> Tuple[str, Dict]:
+        """Classify image type and extract relevant metadata"""
         
-        try:
-            # Open the PDF document
-            pdf_document = fitz.open(self.pdf_path)
-            
-            # Get the specific page
-            page = pdf_document[page_number - 1]
-            
-            # Process images on this page using PyMuPDF
-            image_list = page.get_images(full=True)
-            
-            # Track images for this page
-            page_images = []
-            
-            for img_index, img_info in enumerate(image_list):
-                try:
-                    xref = img_info[0]
-                    base_image = pdf_document.extract_image(xref)
-                    
-                    if not base_image:
-                        continue
-                        
-                    image_bytes = base_image["image"]
-                    image_ext = base_image["ext"]
-                    
-                    # Convert to PIL Image for processing
-                    try:
-                        from io import BytesIO
-                        pil_image = Image.open(BytesIO(image_bytes))
-                    except Exception as e:
-                        logger.warning(f"Failed to open image on page {page_number}: {e}")
-                        continue
-                        
-                    # Check dimensions
-                    width, height = pil_image.size
-                    if width < self.min_width or height < self.min_height:
-                        continue
-                        
-                    # Generate unique filename
-                    timestamp = int(time.time() * 1000)
-                    filename = f"img_p{page_number:03d}_i{img_index+1:03d}_{timestamp}.png"
-                    filepath = os.path.join(self.output_dir, filename)
-                    
-                    # Save the image
-                    pil_image.save(filepath, "PNG")
-                    
-                    # Compute image quality metrics
-                    quality_score = self._compute_image_quality(pil_image)
-                    
-                    # Only process images that meet quality threshold
-                    if quality_score < self.min_quality:
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                        continue
-                        
-                    # Extract text from image if enabled
-                    text_content = ""
-                    has_text = False
-                    if self.extract_text:
-                        text_content = self._extract_text_from_image(pil_image)
-                        has_text = bool(text_content.strip())
-                        
-                    # Categorize image type
-                    image_type = self._categorize_image(pil_image, text_content)
-                    
-                    # Enhance image if enabled
-                    enhancement_applied = False
-                    if self.enhance_images and image_type != "photo":
-                        try:
-                            enhanced = self._enhance_image(pil_image)
-                            enhanced.save(filepath, "PNG")
-                            enhancement_applied = True
-                        except Exception as e:
-                            logger.warning(f"Image enhancement failed: {e}")
-                    
-                    # Gather metadata
-                    image_info = {
-                        "page_number": page_number,
-                        "image_index": img_index + 1,
-                        "filename": filename,
-                        "filepath": filepath,
-                        "width": width,
-                        "height": height,
-                        "image_type": image_type,
-                        "quality_score": quality_score,
-                        "has_text": has_text,
-                        "text_content": text_content,
-                        "extraction_method": "pymupdf",
-                        "enhancement_applied": enhancement_applied,
-                        "vector_elements": 0,  # Not a vector image
-                        "size_bytes": os.path.getsize(filepath)
-                    }
-                    
-                    page_images.append(image_info)
-                    
-                except Exception as e:
-                    logger.error(f"Error extracting image {img_index+1} on page {page_number}: {e}")
-                    traceback.print_exc()
-            
-            # Check if we also have vector graphics on this page
-            vector_images = self._extract_vector_graphics(page, page_number)
-            page_images.extend(vector_images)
-            
-            # Add all valid images from this page
-            images.extend(page_images)
-                
-            pdf_document.close()
-            
-        except Exception as e:
-            logger.error(f"Page {page_number} extraction failed: {e}")
-            traceback.print_exc()
-            
-        return images
-    
-    def extract_images(self) -> List[Dict[str, Any]]:
-        """Extract images from the PDF using multiple methods"""
-        all_images = []
+        # Convert to numpy array for analysis
+        img_array = np.array(image)
         
-        # Try PyMuPDF method first (best for most PDFs)
-        pymupdf_images = self._extract_pymupdf()
-        if pymupdf_images:
-            all_images.extend(pymupdf_images)
-            logger.info(f"Extracted {len(pymupdf_images)} images using PyMuPDF")
+        # Basic image properties
+        width, height = image.size
+        aspect_ratio = width / height if height > 0 else 0
         
-        # If we got very few images, try the embedded method as backup
-        if len(all_images) < 2:
-            embedded_images = self._extract_embedded_images()
-            if embedded_images:
-                all_images.extend(embedded_images)
-                logger.info(f"Extracted {len(embedded_images)} images using embedded method")
+        # Color analysis
+        if len(img_array.shape) == 3:
+            color_variance = np.var(img_array)
+            mean_colors = np.mean(img_array, axis=(0, 1))
+        else:
+            color_variance = np.var(img_array)
+            mean_colors = [np.mean(img_array)]
         
-        # Gather all extracted images
-        self.extracted_images = all_images
+        # Edge detection for structure analysis
+        edges = ImageClassifier._detect_edges(image)
+        edge_density = np.sum(edges > 128) / edges.size if edges is not None else 0
         
-        # Sort images by page and index
-        self.extracted_images.sort(key=lambda x: (x.get("page_number", 0), x.get("image_index", 0)))
+        # Text analysis from OCR
+        text_lower = text_content.lower() if text_content else ""
         
-        # Generate extraction metadata
-        metadata = {
-            "pdf_path": self.pdf_path,
-            "extraction_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "total_pages": self.pages_total,
-            "images": self.extracted_images,
-            "statistics": {
-                "total_images": len(self.extracted_images),
-                "extraction_time_seconds": time.time() - self.start_time,
-                "methods": {
-                    "pymupdf": len([img for img in self.extracted_images if img.get("extraction_method") == "pymupdf"]),
-                    "vector_render": len([img for img in self.extracted_images if img.get("extraction_method") == "vector_render"]),
-                    "embedded": len([img for img in self.extracted_images if img.get("extraction_method") == "embedded"])
-                },
-                "types": {
-                    "chart": len([img for img in self.extracted_images if "chart" in img.get("image_type", "")]),
-                    "diagram": len([img for img in self.extracted_images if "diagram" in img.get("image_type", "")]),
-                    "table": len([img for img in self.extracted_images if "table" in img.get("image_type", "")]),
-                    "portrait": len([img for img in self.extracted_images if "portrait" in img.get("image_type", "")]),
-                    "general": len([img for img in self.extracted_images if "general" in img.get("image_type", "")])
-                }
+        # Vector graphics hint
+        has_many_vectors = vector_count > 50
+        
+        # Classification logic
+        classifications = {
+            'chart': {
+                'indicators': ['axis', 'legend', 'data', 'series', '%', 'chart', 'graph', 'exhibit',
+                             'revenue', 'growth', 'trend', 'performance', 'quarterly', 'annual'],
+                'edge_density_range': (0.05, 0.3),
+                'aspect_ratio_range': (0.5, 2.0),
+                'vector_hint': has_many_vectors,
+                'metadata_extractors': ['chart_type', 'axis_labels', 'data_series', 'exhibit_number']
+            },
+            'diagram': {
+                'indicators': ['flow', 'process', 'step', 'arrow', 'box', 'workflow',
+                             'architecture', 'structure', 'hierarchy', 'relationship'],
+                'edge_density_range': (0.1, 0.4),
+                'aspect_ratio_range': (0.3, 3.0),
+                'vector_hint': has_many_vectors,
+                'metadata_extractors': ['diagram_type', 'components', 'flow_direction']
+            },
+            'infographic': {
+                'indicators': ['infographic', 'data', 'visualization', 'icon', 'trend', 'statistic',
+                             'comparison', 'timeline', 'fact', 'metric'],
+                'edge_density_range': (0.05, 0.5),
+                'aspect_ratio_range': (0.3, 3.0),
+                'vector_hint': has_many_vectors,
+                'metadata_extractors': ['info_sections', 'key_points', 'data_categories']
+            },
+            'table_image': {
+                'indicators': ['table', 'row', 'column', 'cell', 'grid', 'spreadsheet'],
+                'edge_density_range': (0.2, 0.6),
+                'aspect_ratio_range': (0.5, 2.0),
+                'metadata_extractors': ['table_structure', 'cell_count', 'header_detection']
+            },
+            'screenshot': {
+                'indicators': ['screenshot', 'window', 'interface', 'button', 'menu', 'toolbar',
+                             'application', 'software', 'screen'],
+                'edge_density_range': (0.1, 0.5),
+                'aspect_ratio_range': (0.5, 2.0),
+                'metadata_extractors': ['ui_elements', 'application_type']
+            },
+            'logo': {
+                'indicators': ['logo', 'brand', 'trademark', 'Â®', 'â¢', 'copyright', 'Â©'],
+                'edge_density_range': (0.0, 0.3),
+                'aspect_ratio_range': (0.5, 2.0),
+                'metadata_extractors': ['brand_name', 'logo_type']
+            },
+            'photograph': {
+                'indicators': ['photo', 'image', 'picture'],
+                'edge_density_range': (0.0, 0.2),
+                'aspect_ratio_range': (0.3, 3.0),
+                'metadata_extractors': ['subject', 'scene_type']
+            },
+            'scientific_figure': {
+                'indicators': ['figure', 'fig.', 'experiment', 'result', 'scale', 'µm', 'nm',
+                             'microscopy', 'gel', 'blot', 'staining', 'fluorescence'],
+                'edge_density_range': (0.05, 0.4),
+                'aspect_ratio_range': (0.5, 2.0),
+                'metadata_extractors': ['figure_type', 'scale_info', 'annotations', 'methodology']
             }
         }
         
-        # Save metadata to JSON file
-        metadata_path = os.path.join(self.output_dir, "extraction_metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
+        scores = {}
+        for img_type, config in classifications.items():
+            score = 0
+            
+            # Check text indicators
+            for indicator in config['indicators']:
+                if indicator in text_lower:
+                    score += 2
+            
+            # Check edge density
+            edge_min, edge_max = config['edge_density_range']
+            if edge_min <= edge_density <= edge_max:
+                score += 1
+            
+            # Check aspect ratio
+            ar_min, ar_max = config['aspect_ratio_range']
+            if ar_min <= aspect_ratio <= ar_max:
+                score += 0.5
+            
+            # Vector hint bonus
+            if config.get('vector_hint', False):
+                score += 3
+            
+            scores[img_type] = score
         
-        logger.info(f"Extraction complete. Found {len(self.extracted_images)} images.")
-        logger.info(f"Metadata saved to {metadata_path}")
+        # Get best match
+        best_type = max(scores.items(), key=lambda x: x[1])[0]
+        if scores[best_type] == 0:
+            best_type = 'general_image'
         
-        return self.extracted_images
+        # Extract metadata based on type
+        metadata = ImageClassifier._extract_type_specific_metadata(
+            image, text_content, best_type, classifications.get(best_type, {})
+        )
         
-    def extract_images_parallel(self) -> List[Dict[str, Any]]:
-        """Extract images in parallel using multiple processes"""
-        all_images = []
+        return best_type, metadata
+    
+    @staticmethod
+    def _detect_edges(image: Image.Image) -> Optional[np.ndarray]:
+        """Detect edges in image"""
+        if HAS_OPENCV:
+            gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            return edges
+        else:
+            # Fallback to PIL edge detection
+            return np.array(image.convert('L').filter(ImageFilter.FIND_EDGES))
+    
+    @staticmethod
+    def _extract_type_specific_metadata(image: Image.Image, text: str, 
+                                      img_type: str, config: Dict) -> Dict:
+        """Extract metadata specific to image type"""
+        metadata = {'image_classification': img_type}
         
+        if img_type == 'chart':
+            # Try to detect chart type
+            if any(word in text.lower() for word in ['bar', 'column']):
+                metadata['chart_type'] = 'bar_chart'
+            elif any(word in text.lower() for word in ['line', 'trend']):
+                metadata['chart_type'] = 'line_chart'
+            elif any(word in text.lower() for word in ['pie', 'donut']):
+                metadata['chart_type'] = 'pie_chart'
+            elif any(word in text.lower() for word in ['scatter', 'bubble']):
+                metadata['chart_type'] = 'scatter_plot'
+            elif 'heat' in text.lower():
+                metadata['chart_type'] = 'heatmap'
+            else:
+                metadata['chart_type'] = 'unknown'
+            
+            # Extract exhibit number if present
+            exhibit_match = re.search(r'exhibit\s*(\d+)', text.lower())
+            if exhibit_match:
+                metadata['exhibit_number'] = exhibit_match.group(1)
+            
+            # Look for data period
+            year_match = re.findall(r'\b(19|20)\d{2}\b', text)
+            if year_match:
+                metadata['years_referenced'] = year_match
+        
+        elif img_type == 'diagram':
+            if 'flow' in text.lower():
+                metadata['diagram_type'] = 'flowchart'
+            elif 'process' in text.lower():
+                metadata['diagram_type'] = 'process_diagram'
+            elif 'architecture' in text.lower():
+                metadata['diagram_type'] = 'architecture_diagram'
+            else:
+                metadata['diagram_type'] = 'general_diagram'
+        
+        elif img_type == 'table_image':
+            # Count grid lines for table structure
+            metadata['estimated_rows'] = ImageClassifier._estimate_table_rows(image)
+            metadata['estimated_columns'] = ImageClassifier._estimate_table_cols(image)
+        
+        elif img_type == 'scientific_figure':
+            # Look for common scientific figure elements
+            if any(word in text.lower() for word in ['western', 'blot']):
+                metadata['figure_type'] = 'western_blot'
+            elif 'microscopy' in text.lower() or 'magnification' in text.lower():
+                metadata['figure_type'] = 'microscopy'
+            elif 'gel' in text.lower():
+                metadata['figure_type'] = 'gel_electrophoresis'
+            else:
+                metadata['figure_type'] = 'general_scientific'
+            
+            # Extract scale information
+            scale_match = re.search(r'(\d+)\s*(µm|nm|mm|cm)', text)
+            if scale_match:
+                metadata['scale'] = scale_match.group(0)
+        
+        return metadata
+    
+    @staticmethod
+    def _estimate_table_rows(image: Image.Image) -> int:
+        """Estimate number of rows in a table image"""
+        if HAS_OPENCV:
+            gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+            if lines is not None:
+                horizontal_lines = [l for l in lines if abs(l[0][1] - l[0][3]) < 5]
+                return len(horizontal_lines)
+        return 0
+    
+    @staticmethod
+    def _estimate_table_cols(image: Image.Image) -> int:
+        """Estimate number of columns in a table image"""
+        if HAS_OPENCV:
+            gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+            if lines is not None:
+                vertical_lines = [l for l in lines if abs(l[0][0] - l[0][2]) < 5]
+                return len(vertical_lines)
+        return 0
+
+class QualityAnalyzer:
+    """Analyze and score image quality"""
+    
+    @staticmethod
+    def calculate_quality_score(image: Image.Image) -> Tuple[float, Dict]:
+        """Calculate comprehensive quality score"""
+        metrics = {
+            'resolution': QualityAnalyzer._score_resolution(image),
+            'sharpness': QualityAnalyzer._score_sharpness(image),
+            'contrast': QualityAnalyzer._score_contrast(image),
+            'brightness': QualityAnalyzer._score_brightness(image),
+            'noise': QualityAnalyzer._score_noise(image)
+        }
+        
+        # Weighted average
+        weights = {
+            'resolution': 0.3,
+            'sharpness': 0.2,
+            'contrast': 0.2,
+            'brightness': 0.2,
+            'noise': 0.1
+        }
+        
+        quality_score = sum(metrics[k] * weights[k] for k in metrics)
+        
+        return quality_score, metrics
+    
+    @staticmethod
+    def _score_resolution(image: Image.Image) -> float:
+        """Score based on image resolution"""
+        width, height = image.size
+        pixels = width * height
+        
+        if pixels >= 1920 * 1080:  # Full HD or better
+            return 1.0
+        elif pixels >= 1280 * 720:  # HD
+            return 0.8
+        elif pixels >= 640 * 480:   # VGA
+            return 0.6
+        elif pixels >= 320 * 240:   # QVGA
+            return 0.4
+        else:
+            return 0.2
+    
+    @staticmethod
+    def _score_sharpness(image: Image.Image) -> float:
+        """Score based on image sharpness using Laplacian variance"""
+        gray = image.convert('L')
+        array = np.array(gray)
+        
+        if HAS_OPENCV:
+            laplacian = cv2.Laplacian(array, cv2.CV_64F)
+            variance = laplacian.var()
+            # Normalize variance to 0-1 range
+            return min(variance / 1000, 1.0)
+        else:
+            # Fallback: use edge detection
+            edges = gray.filter(ImageFilter.FIND_EDGES)
+            edge_array = np.array(edges)
+            return np.mean(edge_array) / 255
+    
+    @staticmethod
+    def _score_contrast(image: Image.Image) -> float:
+        """Score based on image contrast"""
+        gray = image.convert('L')
+        array = np.array(gray)
+        
+        # Calculate standard deviation as contrast measure
+        std_dev = np.std(array)
+        # Normalize to 0-1 range
+        return min(std_dev / 127.5, 1.0)
+    
+    @staticmethod
+    def _score_brightness(image: Image.Image) -> float:
+        """Score based on image brightness"""
+        gray = image.convert('L')
+        array = np.array(gray)
+        
+        mean_brightness = np.mean(array)
+        # Optimal brightness is around 127 (middle of 0-255 range)
+        # Score decreases as we move away from optimal
+        distance_from_optimal = abs(mean_brightness - 127.5) / 127.5
+        return 1.0 - distance_from_optimal
+    
+    @staticmethod
+    def _score_noise(image: Image.Image) -> float:
+        """Score based on image noise (lower noise = higher score)"""
+        if HAS_OPENCV:
+            array = np.array(image.convert('L'))
+            # Apply Gaussian blur and calculate difference
+            blurred = cv2.GaussianBlur(array, (5, 5), 0)
+            noise = np.mean(np.abs(array.astype(float) - blurred.astype(float)))
+            # Normalize (lower noise = higher score)
+            return max(1.0 - (noise / 50), 0)
+        else:
+            # Fallback: always return decent score
+            return 0.8
+
+class ImageEnhancer:
+    """Enhance image quality for better extraction"""
+    
+    @staticmethod
+    def enhance_image(image: Image.Image, image_type: str) -> Image.Image:
+        """Apply type-specific enhancements"""
+        enhanced = image.copy()
+        
+        if image_type in ['chart', 'diagram', 'table_image']:
+            # Enhance contrast for better line detection
+            enhancer = ImageEnhance.Contrast(enhanced)
+            enhanced = enhancer.enhance(1.5)
+            
+            # Sharpen for clearer edges
+            enhancer = ImageEnhance.Sharpness(enhanced)
+            enhanced = enhancer.enhance(2.0)
+        
+        elif image_type == 'screenshot':
+            # Mild sharpening for text clarity
+            enhancer = ImageEnhance.Sharpness(enhanced)
+            enhanced = enhancer.enhance(1.3)
+        
+        elif image_type == 'photograph':
+            # Balance brightness
+            enhancer = ImageEnhance.Brightness(enhanced)
+            gray = enhanced.convert('L')
+            mean_brightness = np.mean(np.array(gray))
+            if mean_brightness < 100:
+                enhanced = enhancer.enhance(1.2)
+            elif mean_brightness > 155:
+                enhanced = enhancer.enhance(0.8)
+        
+        return enhanced
+
+class TextExtractor:
+    """Extract text from images using OCR"""
+    
+    @staticmethod
+    def extract_text(image: Image.Image, lang: str = 'eng') -> str:
+        """Extract text using available OCR methods"""
+        text = ""
+        
+        # Try Tesseract first
+        if HAS_TESSERACT:
+            try:
+                text = pytesseract.image_to_string(image, lang=lang)
+                text = text.strip()
+            except Exception as e:
+                logger.debug(f"Tesseract OCR failed: {e}")
+        
+        # Try EasyOCR as fallback
+        if not text and HAS_EASYOCR:
+            try:
+                result = reader.readtext(np.array(image))
+                text = ' '.join([item[1] for item in result])
+            except Exception as e:
+                logger.debug(f"EasyOCR failed: {e}")
+        
+        return text
+
+class EnterpriseImageExtractor:
+    """Enterprise-grade PDF image extractor with parallel processing"""
+    
+    def __init__(self, pdf_path: str, output_dir: str = "/data/pdf_images",
+                 config: Optional[Dict] = None):
+        self.pdf_path = Path(pdf_path)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Configuration
+        self.config = config or {}
+        self.min_size = (
+            self.config.get('min_width', 100),
+            self.config.get('min_height', 100)
+        )
+        self.min_quality_score = self.config.get('min_quality_score', 0.3)
+        self.enable_ocr = self.config.get('enable_ocr', True)
+        self.enable_enhancement = self.config.get('enable_enhancement', True)
+        self.save_metadata = self.config.get('save_metadata', True)
+        self.vector_threshold = self.config.get('vector_threshold', 10)
+        # OPTIMIZED: Use all available CPUs up to 16 for Professional plan
+        self.max_workers = self.config.get('max_workers', min(16, os.cpu_count() or 1))
+        self.page_limit = self.config.get('page_limit', None)  # Add page limit support for testing
+        self.clear_output = self.config.get('clear_output', False)
+        
+        # Results storage (thread-safe)
+        self.extracted_images: List[ImageMetadata] = []
+        self._images_lock = threading.Lock()
+        
+        self.extraction_stats = {
+            'total_pages': 0,
+            'pages_with_images': 0,
+            'pages_with_vector_graphics': 0,
+            'embedded_images_found': 0,
+            'vector_graphics_found': 0,
+            'image_types_found': defaultdict(int),
+            'quality_distribution': defaultdict(int),
+            'ocr_success_rate': 0,
+            'total_extraction_time': 0,
+            'extraction_errors': []
+        }
+        
+        # Clear output if requested
+        if self.clear_output:
+            for file in self.output_dir.glob('*.png'):
+                file.unlink()
+            for file in self.output_dir.glob('*.json'):
+                file.unlink()
+    
+    def _atomic_save_image(self, image: Image.Image, filepath: Path) -> bool:
+        """Atomically save image to prevent corruption"""
         try:
-            # Open PDF to get page count
-            pdf_document = fitz.open(self.pdf_path)
-            total_pages = len(pdf_document)
-            pdf_document.close()
+            # Create temp file
+            fd, tmp_path = tempfile.mkstemp(suffix='.png.tmp', dir=str(filepath.parent))
+            os.close(fd)
             
-            self.pages_total = total_pages
-            logger.info(f"Processing {total_pages} pages with {self.max_workers} workers")
+            # Save to temp file
+            image.save(tmp_path, 'PNG', optimize=True)
             
-            # Process pages in parallel
-            with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit tasks for each page
-                future_to_page = {
-                    executor.submit(self._extract_page_images, page_num): page_num 
-                    for page_num in range(1, total_pages + 1)
-                }
-                
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(future_to_page):
-                    page_num = future_to_page[future]
-                    try:
-                        page_images = future.result()
-                        if page_images:
-                            all_images.extend(page_images)
-                            logger.info(f"Page {page_num}: Extracted {len(page_images)} images")
-                    except Exception as e:
-                        logger.error(f"Page {page_num} processing failed: {e}")
-                        traceback.print_exc()
+            # Verify temp file
+            test_img = Image.open(tmp_path)
+            test_img.verify()
             
-            # Gather all extracted images
-            self.extracted_images = all_images
-            
-            # Sort images by page and index
-            self.extracted_images.sort(key=lambda x: (x.get("page_number", 0), x.get("image_index", 0)))
-            
-            # Generate extraction metadata
-            metadata = {
-                "pdf_path": self.pdf_path,
-                "extraction_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "total_pages": self.pages_total,
-                "images": self.extracted_images,
-                "statistics": {
-                    "total_images": len(self.extracted_images),
-                    "extraction_time_seconds": time.time() - self.start_time,
-                    "methods": {
-                        "pymupdf": len([img for img in self.extracted_images if img.get("extraction_method") == "pymupdf"]),
-                        "vector_render": len([img for img in self.extracted_images if img.get("extraction_method") == "vector_render"]),
-                        "embedded": len([img for img in self.extracted_images if img.get("extraction_method") == "embedded"])
-                    },
-                    "types": {
-                        "chart": len([img for img in self.extracted_images if "chart" in img.get("image_type", "")]),
-                        "diagram": len([img for img in self.extracted_images if "diagram" in img.get("image_type", "")]),
-                        "table": len([img for img in self.extracted_images if "table" in img.get("image_type", "")]),
-                        "portrait": len([img for img in self.extracted_images if "portrait" in img.get("image_type", "")]),
-                        "general": len([img for img in self.extracted_images if "general" in img.get("image_type", "")])
-                    }
-                }
-            }
-            
-            # Save metadata to JSON file
-            metadata_path = os.path.join(self.output_dir, "extraction_metadata.json")
-            with open(metadata_path, "w") as f:
-                json.dump(metadata, f, indent=2)
-            
-            logger.info(f"Parallel extraction complete. Found {len(self.extracted_images)} images.")
-            logger.info(f"Metadata saved to {metadata_path}")
+            # Atomic rename
+            shutil.move(tmp_path, str(filepath))
+            return True
             
         except Exception as e:
-            logger.error(f"Parallel extraction failed: {e}")
-            traceback.print_exc()
+            logger.error(f"Atomic save failed for {filepath}: {e}")
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return False
+    
+    def extract_all_images(self):
+        """Main extraction method with parallel processing"""
+        start_time = datetime.now()
+        
+        logger.info(f"Starting image extraction with {self.max_workers} workers")
+        
+        # Open PDF to get page count
+        doc = fitz.open(self.pdf_path)
+        total_pages = len(doc)
+        if self.page_limit:
+            total_pages = min(self.page_limit, total_pages)
+            logger.info(f"Page limit set: processing first {total_pages} pages only")
+        self.extraction_stats['total_pages'] = total_pages
+        doc.close()
+        
+        logger.info(f"Total pages to process: {total_pages}")
+        
+        # Process pages in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit pages up to limit
+            future_to_page = {
+                executor.submit(self._process_page_safe, page_num): page_num
+                for page_num in range(self.extraction_stats['total_pages'])
+            }
             
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_page):
+                page_num = future_to_page[future]
+                
+                try:
+                    page_images = future.result()
+                    if page_images:
+                        self.extraction_stats['pages_with_images'] += 1
+                        logger.info(f"Page {page_num + 1} found {len(page_images)} images")
+                        for img_info in page_images:
+                            self._save_image(img_info)
+                    else:
+                        logger.debug(f"Page {page_num + 1} found no images")
+                            
+                except Exception as e:
+                    logger.error(f"Failed to process page {page_num + 1}: {e}")
+                    self.extraction_stats['extraction_errors'].append({
+                        'page': page_num + 1,
+                        'error': str(e)
+                    })
+        
+        # Calculate final statistics
+        self.extraction_stats['total_extraction_time'] = (
+            datetime.now() - start_time
+        ).total_seconds()
+        
+        # Calculate OCR success rate
+        images_with_text = sum(1 for img in self.extracted_images if img.has_text)
+        total_images = len(self.extracted_images)
+        self.extraction_stats['ocr_success_rate'] = (
+            images_with_text / total_images if total_images > 0 else 0
+        )
+        
+        # Verify saved files
+        verification_issues = self._verify_saved_files()
+        if verification_issues:
+            logger.warning(f"Found {len(verification_issues)} verification issues")
+            self.extraction_stats['verification_issues'] = verification_issues
+        
+        # Save metadata
+        if self.save_metadata:
+            self._save_extraction_metadata()
+        
+        logger.info(f"Extraction complete: {len(self.extracted_images)} images extracted")
+        logger.info(f"  - Embedded images: {self.extraction_stats['embedded_images_found']}")
+        logger.info(f"  - Vector graphics: {self.extraction_stats['vector_graphics_found']}")
+        
         return self.extracted_images
-
+    
+    def _process_page_safe(self, page_num: int) -> List[Dict]:
+        """Thread-safe wrapper for page processing"""
+        try:
+            return self._process_page(page_num)
+        except Exception as e:
+            logger.error(f"Error processing page {page_num + 1}: {e}", exc_info=True)
+            raise
+    
+    def _process_page(self, page_num: int) -> List[Dict]:
+        """Process a single page for images"""
+        logger.debug(f"Processing page {page_num + 1}")
+        doc = fitz.open(self.pdf_path)
+        page = doc[page_num]
+        page_images = []
+        
+        # Extract embedded images
+        embedded_images = self._extract_embedded_images(page, page_num + 1)
+        if embedded_images:
+            page_images.extend(embedded_images)
+            self.extraction_stats['embedded_images_found'] += len(embedded_images)
+            logger.debug(f"Page {page_num + 1} found {len(embedded_images)} embedded images")
+        
+        # Extract vector graphics
+        vector_graphics = self._extract_vector_graphics(page, page_num + 1)
+        if vector_graphics:
+            page_images.extend(vector_graphics)
+            self.extraction_stats['vector_graphics_found'] += len(vector_graphics)
+            self.extraction_stats['pages_with_vector_graphics'] += 1
+            logger.debug(f"Page {page_num + 1} found {len(vector_graphics)} vector graphics")
+        
+        doc.close()
+        logger.debug(f"Page {page_num + 1} total images: {len(page_images)}")
+        return page_images
+    
+    def _extract_embedded_images(self, page: fitz.Page, page_num: int) -> List[Dict]:
+        """Extract traditional embedded images from a page"""
+        images = []
+        image_list = page.get_images()
+        
+        logger.debug(f"Page {page_num} has {len(image_list)} embedded images to check")
+        
+        for img_index, img in enumerate(image_list):
+            try:
+                # Get image data
+                xref = img[0]
+                pix = fitz.Pixmap(page.parent, xref)
+                
+                if pix.n - pix.alpha < 4:  # GRAY or RGB
+                    img_data = pix.tobytes("png")
+                else:  # CMYK
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix.tobytes("png")
+                
+                # Convert to PIL Image
+                image = Image.open(BytesIO(img_data))
+                
+                # Check minimum size
+                if image.width < self.min_size[0] or image.height < self.min_size[1]:
+                    logger.debug(f"Page {page_num} image {img_index} too small: {image.width}x{image.height}")
+                    continue
+                
+                # Calculate quality score
+                quality_score, quality_metrics = QualityAnalyzer.calculate_quality_score(image)
+                
+                if quality_score < self.min_quality_score:
+                    logger.debug(f"Page {page_num} image {img_index} quality too low: {quality_score:.2f}")
+                    continue
+                
+                logger.info(f"Page {page_num} image {img_index} passed filters: {image.width}x{image.height}, quality {quality_score:.2f}")
+                
+                # Extract text if OCR enabled
+                text_content = ""
+                if self.enable_ocr:
+                    text_content = TextExtractor.extract_text(image)
+                
+                # Classify image
+                image_type, type_metadata = ImageClassifier.classify_image(image, text_content)
+                
+                # Enhance image if enabled
+                if self.enable_enhancement:
+                    image = ImageEnhancer.enhance_image(image, image_type)
+                
+                # Get image position on page
+                try:
+                    img_rect = page.get_image_bbox(img)
+                    position = {
+                        'x': img_rect.x0,
+                        'y': img_rect.y0,
+                        'width': img_rect.width,
+                        'height': img_rect.height
+                    }
+                except:
+                    position = {'x': 0, 'y': 0, 'width': image.width, 'height': image.height}
+                
+                # Extract context
+                context = self._extract_image_context(page, img_rect if 'img_rect' in locals() else None)
+                
+                # Create image info
+                img_info = {
+                    'image': image,
+                    'page_number': page_num,
+                    'image_index': img_index + 1,
+                    'image_type': image_type,
+                    'extraction_method': 'embedded',
+                    'quality_score': quality_score,
+                    'quality_metrics': quality_metrics,
+                    'type_metadata': type_metadata,
+                    'text_content': text_content,
+                    'position': position,
+                    'context': context
+                }
+                
+                images.append(img_info)
+                
+            except Exception as e:
+                logger.error(f"Failed to extract embedded image {img_index} from page {page_num}: {e}")
+        
+        return images
+    
+    def _extract_vector_graphics(self, page: fitz.Page, page_num: int) -> List[Dict]:
+        """Extract vector graphics by rendering page"""
+        graphics = []
+        
+        # Get vector drawing count
+        drawings = page.get_drawings()
+        vector_count = len(drawings)
+        
+        logger.debug(f"Page {page_num} has {vector_count} vector drawings (threshold: {self.vector_threshold})")
+        
+        # Only extract if significant vector content
+        if vector_count >= self.vector_threshold:
+            try:
+                # Render page at high resolution
+                mat = fitz.Matrix(3, 3)  # 3x zoom for quality
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_data = pix.tobytes("png")
+                
+                # Convert to PIL Image
+                image = Image.open(BytesIO(img_data))
+                
+                # Extract text if OCR enabled
+                text_content = ""
+                if self.enable_ocr:
+                    text_content = TextExtractor.extract_text(image)
+                
+                # Classify image with vector hint
+                image_type, type_metadata = ImageClassifier.classify_image(
+                    image, text_content, vector_count
+                )
+                
+                # Calculate quality score
+                quality_score, quality_metrics = QualityAnalyzer.calculate_quality_score(image)
+                
+                # Extract context
+                context = self._extract_page_context(page)
+                
+                # Create image info
+                img_info = {
+                    'image': image,
+                    'page_number': page_num,
+                    'image_index': 1,  # Vector renders are one per page
+                    'image_type': image_type,
+                    'extraction_method': 'vector_render',
+                    'quality_score': quality_score,
+                    'quality_metrics': quality_metrics,
+                    'type_metadata': type_metadata,
+                    'text_content': text_content,
+                    'vector_count': vector_count,
+                    'position': {
+                        'x': 0,
+                        'y': 0,
+                        'width': image.width,
+                        'height': image.height
+                    },
+                    'context': context
+                }
+                
+                graphics.append(img_info)
+                logger.info(f"Page {page_num} vector graphics extracted: {image_type}")
+                
+            except Exception as e:
+                logger.error(f"Failed to extract vector graphics from page {page_num}: {e}")
+        
+        return graphics
+    
+    def _extract_image_context(self, page: fitz.Page, img_rect: Optional[fitz.Rect]) -> Dict[str, Any]:
+        """Extract context around image"""
+        context = {
+            'caption': None,
+            'figure_reference': None,
+            'surrounding_text': []
+        }
+        
+        if not img_rect:
+            return context
+        
+        # Get text blocks near image
+        text_blocks = page.get_text("blocks")
+        
+        for block in text_blocks:
+            if len(block) < 5:
+                continue
+            
+            block_rect = fitz.Rect(block[:4])
+            text = block[4].strip()
+            
+            # Check if block is below image (potential caption)
+            if (block_rect.y0 > img_rect.y1 and 
+                block_rect.y0 - img_rect.y1 < 50 and
+                abs(block_rect.x0 - img_rect.x0) < 100):
+                
+                if re.search(r'(Figure|Fig\.|Figure\.|Exhibit)\s*\d+', text, re.IGNORECASE):
+                    context['caption'] = text
+                    # Extract figure reference
+                    fig_match = re.search(r'(Figure|Fig\.?|Exhibit)\s*(\d+)', text, re.IGNORECASE)
+                    if fig_match:
+                        context['figure_reference'] = fig_match.group(0)
+            
+            # Check if block is near image
+            elif (abs(block_rect.y0 - img_rect.y0) < 100 or 
+                  abs(block_rect.y1 - img_rect.y1) < 100):
+                context['surrounding_text'].append(text)
+        
+        return context
+    
+    def _extract_page_context(self, page: fitz.Page) -> Dict[str, Any]:
+        """Extract overall page context"""
+        context = {
+            'page_title': None,
+            'page_text_preview': "",
+            'exhibits_mentioned': []
+        }
+        
+        # Get all text from page
+        text = page.get_text()
+        
+        # Look for title
+        text_blocks = page.get_text("blocks")
+        if text_blocks:
+            for block in text_blocks[:3]:
+                if len(block) >= 5:
+                    potential_title = block[4].strip()
+                    if len(potential_title) > 10 and len(potential_title) < 100:
+                        context['page_title'] = potential_title
+                        break
+        
+        # Get text preview
+        context['page_text_preview'] = text[:200] + "..." if len(text) > 200 else text
+        
+        # Find exhibit references
+        exhibit_matches = re.findall(r'Exhibit\s*\d+', text, re.IGNORECASE)
+        context['exhibits_mentioned'] = list(set(exhibit_matches))
+        
+        return context
+    
+    def _save_image(self, img_info: Dict):
+        """Save image with metadata"""
+        page_num = img_info['page_number']
+        img_index = img_info['image_index']
+        image_type = img_info['image_type']
+        extraction_method = img_info['extraction_method']
+        
+        # Generate filename
+        if extraction_method == 'vector_render':
+            filename = f"page_{page_num}_vector_{image_type}.png"
+        else:
+            filename = f"page_{page_num}_img_{img_index}_{image_type}.png"
+        
+        filepath = self.output_dir / filename
+        
+        # Atomic save
+        if not self._atomic_save_image(img_info['image'], filepath):
+            logger.error(f"Failed to save image {filename}")
+            return
+        
+        # Calculate file size
+        file_size = filepath.stat().st_size
+        
+        # Create metadata
+        metadata = ImageMetadata(
+            filename=filename,
+            page_number=page_num,
+            image_index=img_index,
+            image_type=image_type,
+            extraction_method=extraction_method,
+            width=img_info['image'].width,
+            height=img_info['image'].height,
+            quality_score=img_info['quality_score'],
+            has_text=bool(img_info['text_content']),
+            text_content=img_info['text_content'],
+            visual_elements=img_info['type_metadata'],
+            extraction_timestamp=datetime.now().isoformat(),
+            file_size=file_size,
+            dpi=96,
+            color_mode=img_info['image'].mode,
+            enhancement_applied=self.enable_enhancement,
+            context=img_info['context'],
+            vector_count=img_info.get('vector_count')
+        )
+        
+        # Thread-safe update
+        with self._images_lock:
+            self.extracted_images.append(metadata)
+            
+            # Update statistics
+            self.extraction_stats['image_types_found'][image_type] += 1
+            
+            if metadata.quality_score >= 0.7:
+                self.extraction_stats['quality_distribution']['high'] += 1
+            elif metadata.quality_score >= 0.4:
+                self.extraction_stats['quality_distribution']['medium'] += 1
+            else:
+                self.extraction_stats['quality_distribution']['low'] += 1
+        
+        logger.info(f"Saved {filename} - Type: {image_type}, Method: {extraction_method}, Quality: {metadata.quality_score:.2f}")
+    
+    def _verify_saved_files(self) -> List[Dict]:
+        """Verify all saved image files"""
+        issues = []
+        png_files = list(self.output_dir.glob("*.png"))
+        
+        logger.info(f"Verifying {len(png_files)} image files...")
+        
+        for png_file in png_files:
+            try:
+                # Check file size
+                if png_file.stat().st_size == 0:
+                    issues.append({
+                        'file': png_file.name,
+                        'issue': 'empty_file',
+                        'severity': 'critical'
+                    })
+                    continue
+                
+                # Verify image integrity
+                img = Image.open(png_file)
+                img.verify()
+                
+                # Re-open for additional checks
+                img = Image.open(png_file)
+                
+                # Check dimensions
+                if img.width < 10 or img.height < 10:
+                    issues.append({
+                        'file': png_file.name,
+                        'issue': 'too_small',
+                        'width': img.width,
+                        'height': img.height,
+                        'severity': 'warning'
+                    })
+                
+            except Exception as e:
+                issues.append({
+                    'file': png_file.name,
+                    'issue': 'corrupt_image',
+                    'error': str(e),
+                    'severity': 'critical'
+                })
+        
+        # Check for missing files
+        metadata_files = {img.filename for img in self.extracted_images}
+        actual_files = {f.name for f in png_files}
+        
+        missing_files = metadata_files - actual_files
+        for missing in missing_files:
+            issues.append({
+                'file': missing,
+                'issue': 'file_missing',
+                'severity': 'critical'
+            })
+        
+        if issues:
+            critical_count = sum(1 for i in issues if i.get('severity') == 'critical')
+            logger.warning(f"Verification found {len(issues)} issues ({critical_count} critical)")
+        else:
+            logger.info("All files verified successfully!")
+        
+        return issues
+    
+    def _save_extraction_metadata(self):
+        """Save extraction metadata and statistics"""
+        metadata_file = self.output_dir / 'extraction_metadata.json'
+        
+        metadata = {
+            'pdf_file': str(self.pdf_path),
+            'extraction_timestamp': datetime.now().isoformat(),
+            'configuration': {
+                'min_width': self.min_size[0],
+                'min_height': self.min_size[1],
+                'min_quality_score': self.min_quality_score,
+                'vector_threshold': self.vector_threshold,
+                'enable_ocr': self.enable_ocr,
+                'enable_enhancement': self.enable_enhancement,
+                'max_workers': self.max_workers,
+                'page_limit': self.page_limit
+            },
+            'statistics': dict(self.extraction_stats),
+            'images': [asdict(img) for img in self.extracted_images]
+        }
+        
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Saved metadata to {metadata_file}")
 
 def main():
-    """Main entry point for the CLI tool"""
-    parser = argparse.ArgumentParser(description="Enterprise Image Extractor for PDFs")
-    parser.add_argument("pdf_path", help="Path to the PDF file")
-    parser.add_argument("--output-dir", "-o", default="./pdf_images", help="Directory to save extracted images")
-    parser.add_argument("--min-width", type=int, default=100, help="Minimum image width to extract")
-    parser.add_argument("--min-height", type=int, default=100, help="Minimum image height to extract")
-    parser.add_argument("--min-quality", type=float, default=0.4, help="Minimum image quality score (0-1)")
-    parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF rendering")
-    parser.add_argument("--workers", type=int, default=4, help="Maximum number of worker processes")
-    parser.add_argument("--vector-threshold", type=int, default=10, help="Minimum vector elements to classify as vector")
-    parser.add_argument("--no-text", action="store_false", dest="extract_text", help="Disable text extraction from images")
-    parser.add_argument("--no-enhance", action="store_false", dest="enhance_images", help="Disable image enhancement")
-    parser.add_argument("--clear-output", action="store_true", help="Clear output directory before extraction")
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Enterprise PDF Image Extractor v1.0+ (Enhanced)'
+    )
+    parser.add_argument('pdf_path', help='Path to PDF file', nargs='?', default='/data/input.pdf')
+    parser.add_argument(
+        '--output-dir',
+        default='/data/pdf_images',
+        help='Output directory for extracted images'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='Number of parallel workers (0=auto)'
+    )
+    parser.add_argument(
+        '--min-width',
+        type=int,
+        default=100,
+        help='Minimum image width'
+    )
+    parser.add_argument(
+        '--min-height',
+        type=int,
+        default=100,
+        help='Minimum image height'
+    )
+    parser.add_argument(
+        '--min-quality',
+        type=float,
+        default=0.3,
+        help='Minimum quality score (0-1)'
+    )
+    parser.add_argument(
+        '--vector-threshold',
+        type=int,
+        default=10,
+        help='Minimum vector count to extract page as image'
+    )
+    parser.add_argument(
+        '--no-ocr',
+        action='store_true',
+        help='Disable OCR text extraction'
+    )
+    parser.add_argument(
+        '--no-enhance',
+        action='store_true',
+        help='Disable image enhancement'
+    )
+    parser.add_argument(
+        '--clear-output',
+        action='store_true',
+        help='Clear output directory before extraction'
+    )
+    parser.add_argument(
+        '--page-limit',
+        type=int,
+        default=None,
+        help='Limit extraction to first N pages (for testing)'
+    )
     
     args = parser.parse_args()
     
-    try:
-        # Create extractor
-        extractor = ImageExtractor(
-            pdf_path=args.pdf_path,
-            output_dir=args.output_dir,
-            min_width=args.min_width,
-            min_height=args.min_height,
-            min_quality=args.min_quality,
-            dpi=args.dpi,
-            max_workers=args.workers,
-            vector_threshold=args.vector_threshold,
-            extract_text=args.extract_text,
-            enhance_images=args.enhance_images,
-            clear_output=args.clear_output
-        )
-        
-        # Extract images using parallel processing if multiple workers
-        if args.workers > 1:
-            extractor.extract_images_parallel()
-        else:
-            extractor.extract_images()
-            
-    except Exception as e:
-        logger.error(f"Extraction failed: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-        
-    # Success
-    sys.exit(0)
-
+    # Auto-detect optimal workers
+    if args.workers == 0:
+        args.workers = min(16, os.cpu_count() or 1)
+        logger.info(f"Auto-detected {args.workers} workers")
+    
+    # Configuration
+    config = {
+        'min_width': args.min_width,
+        'min_height': args.min_height,
+        'min_quality_score': args.min_quality,
+        'enable_ocr': not args.no_ocr,
+        'enable_enhancement': not args.no_enhance,
+        'vector_threshold': args.vector_threshold,
+        'save_metadata': True,
+        'max_workers': args.workers,
+        'clear_output': args.clear_output,
+        'page_limit': args.page_limit
+    }
+    
+    # Extract images
+    extractor = EnterpriseImageExtractor(
+        args.pdf_path,
+        args.output_dir,
+        config
+    )
+    
+    images = extractor.extract_all_images()
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("EXTRACTION SUMMARY")
+    print("="*60)
+    print(f"Total pages processed: {extractor.extraction_stats['total_pages']}")
+    print(f"Pages with images: {extractor.extraction_stats['pages_with_images']}")
+    print(f"Pages with vector graphics: {extractor.extraction_stats['pages_with_vector_graphics']}")
+    print(f"Total images extracted: {len(images)}")
+    print(f"  - Embedded images: {extractor.extraction_stats['embedded_images_found']}")
+    print(f"  - Vector graphics: {extractor.extraction_stats['vector_graphics_found']}")
+    print(f"OCR success rate: {extractor.extraction_stats['ocr_success_rate']:.1%}")
+    print(f"Extraction time: {extractor.extraction_stats['total_extraction_time']:.2f}s")
+    print(f"Parallel workers used: {config['max_workers']}")
+    
+    if extractor.extraction_stats['extraction_errors']:
+        print(f"\nExtraction errors: {len(extractor.extraction_stats['extraction_errors'])}")
+    
+    print("\nImage Types Found:")
+    for img_type, count in sorted(
+        extractor.extraction_stats['image_types_found'].items(),
+        key=lambda x: x[1],
+        reverse=True
+    ):
+        print(f"  {img_type}: {count}")
+    
+    print("\nQuality Distribution:")
+    for quality, count in extractor.extraction_stats['quality_distribution'].items():
+        print(f"  {quality.capitalize()}: {count}")
+    
+    if 'verification_issues' in extractor.extraction_stats:
+        issues = extractor.extraction_stats['verification_issues']
+        critical = sum(1 for i in issues if i.get('severity') == 'critical')
+        print(f"\nVerification issues: {len(issues)} ({critical} critical)")
 
 if __name__ == "__main__":
     main()
