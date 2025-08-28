@@ -1,14 +1,12 @@
 """
-PDF Extraction API - TESTING VERSION with Supabase Integration
+PDF Extraction API - Production Version with Supabase Integration
 ===============================================================
 CHANGES IN THIS VERSION:
-1. SKIPS TABLE EXTRACTION ENTIRELY (commented out but preserved)
+1. Tables extraction FULLY ENABLED
 2. Uploads images to Supabase during extraction
 3. Returns URLs instead of base64 when Supabase succeeds
-4. Processes all images by default (set TESTING_IMAGE_LIMIT=0)
+4. Processes all images and tables by default
 5. Fallback to base64 if Supabase fails
-
-TO ENABLE TABLES AGAIN: Uncomment the table extraction sections in /extract/all
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
@@ -33,7 +31,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
-app = FastAPI(title="PDF Extraction API - TESTING VERSION with Supabase", version="1.0.0-testing-supabase")
+app = FastAPI(title="PDF Extraction API - Production Version with Supabase", version="1.0.0")
 
 # Add CORS middleware for n8n
 app.add_middleware(
@@ -127,14 +125,13 @@ async def health_check():
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "0"),
         "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "0"),
         "SUPABASE_CONFIGURED": "YES" if (SUPABASE_URL and SUPABASE_TOKEN) else "NO",
-        "TABLES_SKIPPED": "YES - Temporarily disabled for testing",
-        "LIMITERS": "DISABLED - Processing all images"
+        "TABLES_ENABLED": "YES - Full functionality"
     }
     
     return {
-        "status": "healthy - TESTING MODE with Supabase (TABLES SKIPPED, LIMITERS DISABLED)",
-        "service": "PDF Extraction API - TESTING VERSION",
-        "version": "1.0.0-testing-supabase-no-tables",
+        "status": "healthy - PRODUCTION MODE with Supabase",
+        "service": "PDF Extraction API - Production Version",
+        "version": "1.0.0",
         "timestamp": datetime.now().isoformat(),
         "testing_limits": testing_indicators
     }
@@ -149,7 +146,7 @@ async def test_extraction(
         "success": True,
         "filename": file.filename,
         "content_type": file.content_type,
-        "message": "File received successfully - TESTING MODE",
+        "message": "File received successfully",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN)
     }
 
@@ -160,21 +157,23 @@ async def extract_all(
     workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
-    # TESTING LIMITERS (optional)
+    # LIMITERS (optional)
     limit_tables: Optional[int] = None,
     limit_images: Optional[int] = None,
+    page_limit: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
-    """Extract both tables and images from PDF - TESTING VERSION WITH SUPABASE (TABLES TEMPORARILY DISABLED)"""
+    """Extract both tables and images from PDF"""
     temp_dir = tempfile.mkdtemp()
 
     # Resolve temp limits
     eff_limit_tables = _limit_from(limit_tables, "TEMP_LIMIT_TABLES")
     eff_limit_images = _limit_from(limit_images, "TEMP_LIMIT_IMAGES")
+    
     if eff_limit_tables > 0:
-        logger.info(f"[TESTING LIMIT] /all: Tables packaging limited to {eff_limit_tables}.")
+        logger.info(f"[LIMIT] /all: Tables packaging limited to {eff_limit_tables}.")
     if eff_limit_images > 0:
-        logger.info(f"[TESTING LIMIT] /all: Images packaging limited to {eff_limit_images}.")
+        logger.info(f"[LIMIT] /all: Images packaging limited to {eff_limit_images}.")
     else:
         logger.info("[LIMITERS DISABLED] Processing all images")
 
@@ -197,14 +196,9 @@ async def extract_all(
         all_results = []
 
         # ============================================
-        # TABLE EXTRACTION - TEMPORARILY DISABLED
+        # TABLE EXTRACTION
         # ============================================
-        logger.info("📋 TABLE EXTRACTION: SKIPPED (Temporarily disabled for testing)")
-        logger.info("Tables will be added back once image pipeline is fully working")
-        
-        """
-        # PRESERVED TABLE EXTRACTION CODE - UNCOMMENT TO RE-ENABLE
-        logger.info("Extracting tables...")
+        logger.info("📋 Extracting tables...")
         table_cmd = [
             sys.executable,
             "enterprise_table_extractor_full.py",
@@ -214,6 +208,11 @@ async def extract_all(
             "--min-quality", str(min_quality),
             "--clear-output"
         ]
+        
+        # Add page limit if specified
+        if page_limit:
+            table_cmd.extend(["--page-limit", str(page_limit)])
+            
         logger.info(f"Running command: {' '.join(table_cmd)}")
 
         try:
@@ -221,7 +220,7 @@ async def extract_all(
                 table_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=1800  # 30 minutes timeout
             )
 
             logger.info(f"Table extraction exit code: {table_result.returncode}")
@@ -282,7 +281,6 @@ async def extract_all(
             logger.error("Table extraction timed out")
         except Exception as e:
             logger.error(f"Table extraction error: {e}", exc_info=True)
-        """
 
         # ============================================
         # IMAGE EXTRACTION - WITH SUPABASE UPLOAD
@@ -300,6 +298,11 @@ async def extract_all(
             "--vector-threshold", "10",
             "--clear-output"
         ]
+        
+        # Add page limit if specified
+        if page_limit:
+            image_cmd.extend(["--page-limit", str(page_limit)])
+            
         logger.info(f"Running command: {' '.join(image_cmd)}")
 
         try:
@@ -307,7 +310,7 @@ async def extract_all(
                 image_cmd,
                 capture_output=True,
                 text=True,
-                timeout=300
+                timeout=900  # 15 minutes timeout
             )
 
             logger.info(f"Image extraction exit code: {image_result.returncode}")
@@ -321,7 +324,7 @@ async def extract_all(
                 image_files.sort()
                 if eff_limit_images > 0:
                     image_files = image_files[:eff_limit_images]
-                    logger.info(f"Limiting to {eff_limit_images} images for testing")
+                    logger.info(f"Limiting to {eff_limit_images} images")
                 else:
                     logger.info(f"Processing all {len(image_files)} images")
 
@@ -383,7 +386,7 @@ async def extract_all(
                         # Fallback to base64
                         with open(img_path, 'rb') as f:
                             img_base64 = base64.b64encode(f.read()).decode('utf-8')
-                        result_item['base64_content'] = img_base64  # Fixed field name
+                        result_item['base64_content'] = img_base64
                         logger.info(f"⚠️ Image {img_file} using base64 fallback")
 
                     all_results.append(result_item)
@@ -395,20 +398,25 @@ async def extract_all(
         except Exception as e:
             logger.error(f"Image extraction error: {e}", exc_info=True)
 
-        # Sort results by page and index (like the original script)
+        # Sort results by page and index
         all_results.sort(key=lambda x: (x.get('page', 0), x.get('index', 0)))
-        logger.info(f"Total results: {len(all_results)} items (0 tables, {len(all_results)} images)")
+        
+        # Count tables and images
+        table_count = sum(1 for item in all_results if item.get('type') == 'table')
+        image_count = sum(1 for item in all_results if item.get('type') == 'image')
+        
+        logger.info(f"Total results: {len(all_results)} items ({table_count} tables, {image_count} images)")
 
-        # Return wrapped response to prevent n8n from unwrapping single-item arrays
+        # Return wrapped response
         return {
             "results": all_results,
             "count": len(all_results),
+            "tables_count": table_count,
+            "images_count": image_count,
             "extraction_timestamp": datetime.now().isoformat(),
             "success": True,
-            "testing_mode": True,
-            "limiters_disabled": True,
             "supabase_enabled": bool(SUPABASE_URL and SUPABASE_TOKEN),
-            "tables_skipped": True
+            "page_limit": page_limit
         }
 
     except Exception as e:
@@ -484,14 +492,13 @@ async def check_environment():
     except Exception as e:
         checks["test_import"] = {"error": str(e)}
 
-    # TESTING MODE INDICATORS
-    checks["testing_limits"] = {
+    # LIMITER STATUS
+    checks["limiter_status"] = {
         "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "0"),
         "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "0"),
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "0"),
         "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "0"),
-        "TABLES_EXTRACTION": "DISABLED FOR TESTING",
-        "LIMITERS": "DISABLED - Processing all images"
+        "TABLES_EXTRACTION": "FULLY ENABLED"
     }
     
     # SUPABASE STATUS
@@ -508,13 +515,11 @@ async def check_environment():
 async def test_endpoint():
     """Simple test endpoint that doesn't require auth"""
     return {
-        "message": "API is working! - TESTING MODE with Supabase (Tables Disabled, Limiters Disabled)",
+        "message": "API is working! - Production Mode with Supabase",
         "timestamp": datetime.now().isoformat(),
         "python_version": sys.version,
-        "testing_mode": True,
-        "limiters_disabled": True,
-        "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN),
-        "tables_disabled": True
+        "tables_enabled": True,
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN)
     }
 
 if __name__ == "__main__":
