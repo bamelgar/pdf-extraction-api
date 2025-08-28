@@ -5,7 +5,7 @@ CHANGES IN THIS VERSION:
 1. SKIPS TABLE EXTRACTION ENTIRELY (commented out but preserved)
 2. Uploads images to Supabase during extraction
 3. Returns URLs instead of base64 when Supabase succeeds
-4. Testing limiters active (currently 5, change to 12 via env vars)
+4. Limiters REMOVED for full image extraction
 5. Fallback to base64 if Supabase fails
 
 TO ENABLE TABLES AGAIN: Uncomment the table extraction sections in /extract/all
@@ -96,46 +96,21 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return credentials.credentials
 
-def _limit_from(query_value: Optional[int], env_key: str) -> Optional[int]:
-    """
-    TESTING LIMITER:
-    - If a positive integer is provided via query param, use it.
-    - Else if env var exists and is positive, use it.
-    - Else None (no limit).
-    """
-    try:
-        if query_value is not None:
-            val = int(query_value)
-            return val if val > 0 else None
-    except Exception:
-        pass
-    try:
-        env_val = os.environ.get(env_key)
-        if env_val:
-            val = int(env_val)
-            return val if val > 0 else None
-    except Exception:
-        pass
-    return None
-
 @app.get("/")
 async def health_check():
     # TESTING MODE INDICATOR
     testing_indicators = {
-        "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
-        "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
-        "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
-        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set"),
         "SUPABASE_CONFIGURED": "YES" if (SUPABASE_URL and SUPABASE_TOKEN) else "NO",
-        "TABLES_SKIPPED": "YES - Temporarily disabled for testing"
+        "TABLES_SKIPPED": "YES - Temporarily disabled for testing",
+        "LIMITERS_REMOVED": "YES - Processing all images"
     }
     
     return {
-        "status": "healthy - TESTING MODE with Supabase (TABLES SKIPPED)",
+        "status": "healthy - TESTING MODE with Supabase (TABLES SKIPPED, LIMITERS REMOVED)",
         "service": "PDF Extraction API - TESTING VERSION",
         "version": "1.0.0-testing-supabase-no-tables",
         "timestamp": datetime.now().isoformat(),
-        "testing_limits": testing_indicators
+        "testing_info": testing_indicators
     }
 
 @app.post("/extract/test")
@@ -159,21 +134,10 @@ async def extract_all(
     workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
-    # TESTING LIMITERS (optional)
-    limit_tables: Optional[int] = None,
-    limit_images: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
     """Extract both tables and images from PDF - TESTING VERSION WITH SUPABASE (TABLES TEMPORARILY DISABLED)"""
     temp_dir = tempfile.mkdtemp()
-
-    # Resolve temp limits
-    eff_limit_tables = _limit_from(limit_tables, "TEMP_LIMIT_TABLES")
-    eff_limit_images = _limit_from(limit_images, "TEMP_LIMIT_IMAGES")
-    if eff_limit_tables:
-        logger.info(f"[TESTING LIMIT] /all: Tables packaging limited to {eff_limit_tables}.")
-    if eff_limit_images:
-        logger.info(f"[TESTING LIMIT] /all: Images packaging limited to {eff_limit_images}.")
 
     try:
         # Save uploaded file
@@ -236,8 +200,6 @@ async def extract_all(
                     logger.info(f"Found {len(table_metadata.get('tables', []))} tables in metadata")
 
                     table_list = table_metadata.get('tables', [])
-                    if eff_limit_tables is not None:
-                        table_list = table_list[:eff_limit_tables]
 
                     for table_info in table_list:
                         result_item = {
@@ -316,9 +278,9 @@ async def extract_all(
                 # List files in output directory
                 image_files = [f for f in os.listdir(images_dir) if f.lower().endswith('.png')]
                 image_files.sort()
-                if eff_limit_images is not None:
-                    image_files = image_files[:eff_limit_images]
-                    logger.info(f"Limiting to {eff_limit_images} images for testing")
+                
+                # LIMITERS REMOVED - Process all images
+                logger.info(f"Processing all {len(image_files)} images")
 
                 # Read image metadata
                 image_metadata_path = os.path.join(images_dir, "extraction_metadata.json")
@@ -327,7 +289,7 @@ async def extract_all(
                     with open(image_metadata_path, 'r') as f:
                         image_metadata = json.load(f)
 
-                logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata (packaging up to {len(image_files)})")
+                logger.info(f"Found {len(image_metadata.get('images', []))} images in metadata (packaging {len(image_files)})")
 
                 # Pre-index metadata for filename lookup
                 meta_map = {}
@@ -401,6 +363,7 @@ async def extract_all(
             "extraction_timestamp": datetime.now().isoformat(),
             "success": True,
             "testing_mode": True,
+            "limiters_removed": True,
             "supabase_enabled": bool(SUPABASE_URL and SUPABASE_TOKEN),
             "tables_skipped": True
         }
@@ -478,12 +441,9 @@ async def check_environment():
     except Exception as e:
         checks["test_import"] = {"error": str(e)}
 
-    # TESTING MODE INDICATORS
-    checks["testing_limits"] = {
-        "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "not set"),
-        "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "not set"),
-        "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "not set"),
-        "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "not set"),
+    # TESTING INFO
+    checks["testing_info"] = {
+        "LIMITERS_REMOVED": "YES - Processing all images",
         "TABLES_EXTRACTION": "DISABLED FOR TESTING"
     }
     
@@ -501,10 +461,11 @@ async def check_environment():
 async def test_endpoint():
     """Simple test endpoint that doesn't require auth"""
     return {
-        "message": "API is working! - TESTING MODE with Supabase (Tables Disabled)",
+        "message": "API is working! - TESTING MODE with Supabase (Tables Disabled, Limiters Removed)",
         "timestamp": datetime.now().isoformat(),
         "python_version": sys.version,
         "testing_mode": True,
+        "limiters_removed": True,
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_TOKEN),
         "tables_disabled": True
     }
