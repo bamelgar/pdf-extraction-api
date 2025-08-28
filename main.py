@@ -7,6 +7,7 @@ CHANGES IN THIS VERSION:
 3. Returns URLs instead of base64 when Supabase succeeds
 4. Processes all images and tables by default (limiters set to 0)
 5. Fallback to base64 if Supabase fails
+6. Multiple URL fields for better compatibility with RAG systems
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
@@ -154,7 +155,7 @@ async def test_extraction(
 async def extract_all(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 8,
+    workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
     # LIMITERS (optional)
@@ -378,10 +379,12 @@ async def extract_all(
                     }
                     
                     if supabase_url:
-                        # Supabase upload successful
+                        # Supabase upload successful - ADD MULTIPLE URL FIELDS
                         result_item['supabase_url'] = supabase_url
+                        result_item['url'] = supabase_url  # Add standard URL field
+                        result_item['image_url'] = supabase_url  # Add image-specific URL field
                         result_item['uploaded_filename'] = unique_filename
-                        logger.info(f"✅ Image {img_file} uploaded to Supabase")
+                        logger.info(f"✅ Image {img_file} uploaded to Supabase: {supabase_url}")
                     else:
                         # Fallback to base64
                         with open(img_path, 'rb') as f:
