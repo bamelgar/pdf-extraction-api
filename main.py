@@ -5,7 +5,7 @@ CHANGES IN THIS VERSION:
 1. SKIPS TABLE EXTRACTION ENTIRELY (commented out but preserved)
 2. Uploads images to Supabase during extraction
 3. Returns URLs instead of base64 when Supabase succeeds
-4. Limiters REMOVED for full image extraction
+4. LIMITERS REMOVED - will process all images
 5. Fallback to base64 if Supabase fails
 
 TO ENABLE TABLES AGAIN: Uncomment the table extraction sections in /extract/all
@@ -96,6 +96,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return credentials.credentials
 
+def _limit_from(query_value: Optional[int], env_key: str) -> Optional[int]:
+    """
+    Return None to disable all limits.
+    """
+    return None
+
 @app.get("/")
 async def health_check():
     # TESTING MODE INDICATOR
@@ -134,10 +140,18 @@ async def extract_all(
     workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
+    # TESTING LIMITERS (disabled)
+    limit_tables: Optional[int] = None,
+    limit_images: Optional[int] = None,
     token: str = Depends(verify_token)
 ):
     """Extract both tables and images from PDF - TESTING VERSION WITH SUPABASE (TABLES TEMPORARILY DISABLED)"""
     temp_dir = tempfile.mkdtemp()
+
+    # Resolve temp limits (always None)
+    eff_limit_tables = None
+    eff_limit_images = None
+    logger.info(f"[LIMITERS REMOVED] Processing all images")
 
     try:
         # Save uploaded file
@@ -279,7 +293,7 @@ async def extract_all(
                 image_files = [f for f in os.listdir(images_dir) if f.lower().endswith('.png')]
                 image_files.sort()
                 
-                # LIMITERS REMOVED - Process all images
+                # Process all images (no limits)
                 logger.info(f"Processing all {len(image_files)} images")
 
                 # Read image metadata
