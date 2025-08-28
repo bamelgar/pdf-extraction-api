@@ -127,7 +127,7 @@ class ImageClassifier:
                 'metadata_extractors': ['chart_type', 'axis_labels', 'data_series', 'exhibit_number']
             },
             'diagram': {
-                'indicators': ['flow', 'process', 'step', 'arrow', 'box', 'workflow',
+                'indicators': ['flow', 'process', 'step', 'arrow', 'ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢', 'box', 'workflow',
                              'architecture', 'structure', 'hierarchy', 'relationship'],
                 'edge_density_range': (0.1, 0.4),
                 'aspect_ratio_range': (0.3, 3.0),
@@ -156,7 +156,7 @@ class ImageClassifier:
                 'metadata_extractors': ['ui_elements', 'application_type']
             },
             'logo': {
-                'indicators': ['logo', 'brand', 'trademark', 'Â®', 'â¢', 'copyright', 'Â©'],
+                'indicators': ['logo', 'brand', 'trademark', 'Ãƒâ€šÃ‚Â®', 'ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢', 'copyright', 'Ãƒâ€šÃ‚Â©'],
                 'edge_density_range': (0.0, 0.3),
                 'aspect_ratio_range': (0.5, 2.0),
                 'metadata_extractors': ['brand_name', 'logo_type']
@@ -168,7 +168,7 @@ class ImageClassifier:
                 'metadata_extractors': ['subject', 'scene_type']
             },
             'scientific_figure': {
-                'indicators': ['figure', 'fig.', 'experiment', 'result', 'scale', 'µm', 'nm',
+                'indicators': ['figure', 'fig.', 'experiment', 'result', 'scale', 'ÃƒÅ½Ã‚Â¼m', 'nm',
                              'microscopy', 'gel', 'blot', 'staining', 'fluorescence'],
                 'edge_density_range': (0.05, 0.4),
                 'aspect_ratio_range': (0.5, 2.0),
@@ -282,7 +282,7 @@ class ImageClassifier:
                 metadata['figure_type'] = 'general_scientific'
             
             # Extract scale information
-            scale_match = re.search(r'(\d+)\s*(µm|nm|mm|cm)', text)
+            scale_match = re.search(r'(\d+)\s*(ÃƒÅ½Ã‚Â¼m|nm|mm|cm)', text)
             if scale_match:
                 metadata['scale'] = scale_match.group(0)
         
@@ -490,9 +490,7 @@ class EnterpriseImageExtractor:
         self.enable_enhancement = self.config.get('enable_enhancement', True)
         self.save_metadata = self.config.get('save_metadata', True)
         self.vector_threshold = self.config.get('vector_threshold', 10)
-        # OPTIMIZED: Use all available CPUs up to 16 for Professional plan
-        self.max_workers = self.config.get('max_workers', min(16, os.cpu_count() or 1))
-        self.page_limit = self.config.get('page_limit', None)  # Add page limit support for testing
+        self.max_workers = self.config.get('max_workers', min(4, os.cpu_count() or 1))
         self.clear_output = self.config.get('clear_output', False)
         
         # Results storage (thread-safe)
@@ -547,22 +545,16 @@ class EnterpriseImageExtractor:
         """Main extraction method with parallel processing"""
         start_time = datetime.now()
         
-        logger.info(f"Starting image extraction with {self.max_workers} workers")
+        logger.info(f"Starting enhanced image extraction with {self.max_workers} workers")
         
         # Open PDF to get page count
         doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        if self.page_limit:
-            total_pages = min(self.page_limit, total_pages)
-            logger.info(f"Page limit set: processing first {total_pages} pages only")
-        self.extraction_stats['total_pages'] = total_pages
+        self.extraction_stats['total_pages'] = len(doc)
         doc.close()
-        
-        logger.info(f"Total pages to process: {total_pages}")
         
         # Process pages in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit pages up to limit
+            # Submit all pages
             future_to_page = {
                 executor.submit(self._process_page_safe, page_num): page_num
                 for page_num in range(self.extraction_stats['total_pages'])
@@ -571,17 +563,12 @@ class EnterpriseImageExtractor:
             # Process results as they complete
             for future in concurrent.futures.as_completed(future_to_page):
                 page_num = future_to_page[future]
-                
                 try:
                     page_images = future.result()
                     if page_images:
                         self.extraction_stats['pages_with_images'] += 1
-                        logger.info(f"Page {page_num + 1} found {len(page_images)} images")
                         for img_info in page_images:
                             self._save_image(img_info)
-                    else:
-                        logger.debug(f"Page {page_num + 1} found no images")
-                            
                 except Exception as e:
                     logger.error(f"Failed to process page {page_num + 1}: {e}")
                     self.extraction_stats['extraction_errors'].append({
@@ -627,7 +614,6 @@ class EnterpriseImageExtractor:
     
     def _process_page(self, page_num: int) -> List[Dict]:
         """Process a single page for images"""
-        logger.debug(f"Processing page {page_num + 1}")
         doc = fitz.open(self.pdf_path)
         page = doc[page_num]
         page_images = []
@@ -637,7 +623,6 @@ class EnterpriseImageExtractor:
         if embedded_images:
             page_images.extend(embedded_images)
             self.extraction_stats['embedded_images_found'] += len(embedded_images)
-            logger.debug(f"Page {page_num + 1} found {len(embedded_images)} embedded images")
         
         # Extract vector graphics
         vector_graphics = self._extract_vector_graphics(page, page_num + 1)
@@ -645,18 +630,14 @@ class EnterpriseImageExtractor:
             page_images.extend(vector_graphics)
             self.extraction_stats['vector_graphics_found'] += len(vector_graphics)
             self.extraction_stats['pages_with_vector_graphics'] += 1
-            logger.debug(f"Page {page_num + 1} found {len(vector_graphics)} vector graphics")
         
         doc.close()
-        logger.debug(f"Page {page_num + 1} total images: {len(page_images)}")
         return page_images
     
     def _extract_embedded_images(self, page: fitz.Page, page_num: int) -> List[Dict]:
         """Extract traditional embedded images from a page"""
         images = []
         image_list = page.get_images()
-        
-        logger.debug(f"Page {page_num} has {len(image_list)} embedded images to check")
         
         for img_index, img in enumerate(image_list):
             try:
@@ -675,17 +656,13 @@ class EnterpriseImageExtractor:
                 
                 # Check minimum size
                 if image.width < self.min_size[0] or image.height < self.min_size[1]:
-                    logger.debug(f"Page {page_num} image {img_index} too small: {image.width}x{image.height}")
                     continue
                 
                 # Calculate quality score
                 quality_score, quality_metrics = QualityAnalyzer.calculate_quality_score(image)
                 
                 if quality_score < self.min_quality_score:
-                    logger.debug(f"Page {page_num} image {img_index} quality too low: {quality_score:.2f}")
                     continue
-                
-                logger.info(f"Page {page_num} image {img_index} passed filters: {image.width}x{image.height}, quality {quality_score:.2f}")
                 
                 # Extract text if OCR enabled
                 text_content = ""
@@ -744,8 +721,6 @@ class EnterpriseImageExtractor:
         drawings = page.get_drawings()
         vector_count = len(drawings)
         
-        logger.debug(f"Page {page_num} has {vector_count} vector drawings (threshold: {self.vector_threshold})")
-        
         # Only extract if significant vector content
         if vector_count >= self.vector_threshold:
             try:
@@ -795,7 +770,6 @@ class EnterpriseImageExtractor:
                 }
                 
                 graphics.append(img_info)
-                logger.info(f"Page {page_num} vector graphics extracted: {image_type}")
                 
             except Exception as e:
                 logger.error(f"Failed to extract vector graphics from page {page_num}: {e}")
@@ -931,7 +905,9 @@ class EnterpriseImageExtractor:
             else:
                 self.extraction_stats['quality_distribution']['low'] += 1
         
-        logger.info(f"Saved {filename} - Type: {image_type}, Method: {extraction_method}, Quality: {metadata.quality_score:.2f}")
+        logger.debug(f"Saved {filename} - Type: {image_type}, "
+                    f"Method: {extraction_method}, "
+                    f"Quality: {metadata.quality_score:.2f}")
     
     def _verify_saved_files(self) -> List[Dict]:
         """Verify all saved image files"""
@@ -1010,8 +986,7 @@ class EnterpriseImageExtractor:
                 'vector_threshold': self.vector_threshold,
                 'enable_ocr': self.enable_ocr,
                 'enable_enhancement': self.enable_enhancement,
-                'max_workers': self.max_workers,
-                'page_limit': self.page_limit
+                'max_workers': self.max_workers
             },
             'statistics': dict(self.extraction_stats),
             'images': [asdict(img) for img in self.extracted_images]
@@ -1080,18 +1055,12 @@ def main():
         action='store_true',
         help='Clear output directory before extraction'
     )
-    parser.add_argument(
-        '--page-limit',
-        type=int,
-        default=None,
-        help='Limit extraction to first N pages (for testing)'
-    )
     
     args = parser.parse_args()
     
     # Auto-detect optimal workers
     if args.workers == 0:
-        args.workers = min(16, os.cpu_count() or 1)
+        args.workers = min(4, os.cpu_count() or 1)
         logger.info(f"Auto-detected {args.workers} workers")
     
     # Configuration
@@ -1104,8 +1073,7 @@ def main():
         'vector_threshold': args.vector_threshold,
         'save_metadata': True,
         'max_workers': args.workers,
-        'clear_output': args.clear_output,
-        'page_limit': args.page_limit
+        'clear_output': args.clear_output
     }
     
     # Extract images
