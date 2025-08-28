@@ -2,10 +2,10 @@
 PDF Extraction API - Production Version with Supabase Integration
 ===============================================================
 CHANGES IN THIS VERSION:
-1. Tables extraction FULLY ENABLED
+1. Tables extraction FULLY ENABLED using limiter version
 2. Uploads images to Supabase during extraction
 3. Returns URLs instead of base64 when Supabase succeeds
-4. Processes all images and tables by default
+4. Processes all images and tables by default (limiters set to 0)
 5. Fallback to base64 if Supabase fails
 """
 
@@ -118,14 +118,14 @@ def _limit_from(query_value: Optional[int], env_key: str) -> int:
 
 @app.get("/")
 async def health_check():
-    # TESTING MODE INDICATOR
+    # Status indicators
     testing_indicators = {
         "TESTING_IMAGE_LIMIT": os.environ.get("TESTING_IMAGE_LIMIT", "0"),
         "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "0"),
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "0"),
         "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "0"),
         "SUPABASE_CONFIGURED": "YES" if (SUPABASE_URL and SUPABASE_TOKEN) else "NO",
-        "TABLES_ENABLED": "YES - Full functionality"
+        "TABLES_ENABLED": "YES - Full functionality with limiter version"
     }
     
     return {
@@ -175,7 +175,7 @@ async def extract_all(
     if eff_limit_images > 0:
         logger.info(f"[LIMIT] /all: Images packaging limited to {eff_limit_images}.")
     else:
-        logger.info("[LIMITERS DISABLED] Processing all images")
+        logger.info("[LIMITERS DISABLED] Processing all images and tables")
 
     try:
         # Save uploaded file
@@ -196,12 +196,12 @@ async def extract_all(
         all_results = []
 
         # ============================================
-        # TABLE EXTRACTION
+        # TABLE EXTRACTION - USING LIMITER VERSION
         # ============================================
         logger.info("📋 Extracting tables...")
         table_cmd = [
             sys.executable,
-            "enterprise_table_extractor_full.py",
+            "enterprise_table_extractor_full.py",  # Use limiter version
             pdf_path,
             "--output-dir", tables_dir,
             "--workers", str(workers),
@@ -498,7 +498,7 @@ async def check_environment():
         "TESTING_TABLE_LIMIT": os.environ.get("TESTING_TABLE_LIMIT", "0"),
         "TEMP_LIMIT_TABLES": os.environ.get("TEMP_LIMIT_TABLES", "0"),
         "TEMP_LIMIT_IMAGES": os.environ.get("TEMP_LIMIT_IMAGES", "0"),
-        "TABLES_EXTRACTION": "FULLY ENABLED"
+        "TABLES_EXTRACTION": "ENABLED WITH LIMITER"
     }
     
     # SUPABASE STATUS
