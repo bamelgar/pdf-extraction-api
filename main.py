@@ -246,7 +246,7 @@ async def extract_all(
     file: UploadFile = File(...),
     # shared knobs
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     page_limit: Optional[int] = None,
     # image-only knobs
     min_width: int = 100,
@@ -403,7 +403,7 @@ async def extract_all(
 async def extract_tables_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     page_limit: Optional[int] = None,
     token: bool = Depends(verify),
 ):
@@ -418,7 +418,7 @@ async def extract_tables_only(
 async def extract_images_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     min_width: int = 100,
     min_height: int = 100,
     page_limit: Optional[int] = None,
