@@ -85,9 +85,6 @@ All changes here are confined to:
   (c) adding **runtime toggles** for selective execution,
   (d) startup logging so Render shows UPLOAD_TABLE_CSVS state immediately.
 """
-
-
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -99,7 +96,7 @@ from typing import Dict, Any, List, Optional
 # --------------------------------------------------------------------------------------
 # App & CORS
 # --------------------------------------------------------------------------------------
-app = FastAPI(title="PDF Extraction API", version="1.2.0")
+app = FastAPI(title="PDF Extraction API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -149,9 +146,9 @@ log.info("Tesseract available: %s", bool(shutil.which("tesseract")))
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
-async def run_proc(cmd: List[str], timeout: int = 300) -> Dict[str, Any]:
+async def run_proc(cmd: List[str], timeout: int) -> Dict[str, Any]:
     """Run a subprocess asynchronously. Returns {'exit','stdout','stderr'}."""
-    log.info("Running: %s", " ".join(cmd))
+    log.info("Running: %s (timeout=%ss)", " ".join(cmd), timeout)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -212,10 +209,15 @@ async def root():
     return {
         "status": "healthy",
         "service": "PDF Extraction API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "timestamp": _now(),
         "TABLES_ENABLED": "YES - Full functionality with limiter version",
     }
+
+# silence Render's HEAD probe 405s
+@app.head("/")
+async def head_root():
+    return {}
 
 @app.get("/debug/check-environment")
 async def check_environment():
@@ -239,14 +241,14 @@ async def check_environment():
     return checks
 
 # --------------------------------------------------------------------------------------
-# Core: /extract/all  (concurrent orchestration)
+# Core: /extract/all  (concurrent orchestration + configurable timeouts)
 # --------------------------------------------------------------------------------------
 @app.post("/extract/all")
 async def extract_all(
     file: UploadFile = File(...),
     # shared knobs
     min_quality: float = 0.3,
-    workers: int = 8,
+    workers: int = 4,
     page_limit: Optional[int] = None,
     # image-only knobs
     min_width: int = 100,
@@ -254,6 +256,11 @@ async def extract_all(
     # toggles
     include_images: Optional[bool] = True,
     include_tables: Optional[bool] = True,
+    # timeouts (seconds)
+    table_timeout_s: int = 900,
+    image_timeout_s: int = 900,
+    # optional speed knob for tables
+    no_verification: bool = False,
     token: bool = Depends(verify),
 ):
     temp_dir = tempfile.mkdtemp()
@@ -277,6 +284,8 @@ async def extract_all(
         ]
         if page_limit and int(page_limit) > 0:
             table_cmd += ["--page-limit", str(int(page_limit))]
+        if no_verification:
+            table_cmd += ["--no-verification"]
 
         image_cmd = [
             sys.executable, "enterprise_image_extractor.py", pdf_path,
@@ -291,15 +300,15 @@ async def extract_all(
         if page_limit and int(page_limit) > 0:
             image_cmd += ["--page-limit", str(int(page_limit))]
 
-        # ----- Launch concurrently (respect toggles) -----
+        # ----- Launch concurrently (respect toggles & timeouts) -----
         tasks = []
         if include_tables:
-            tasks.append(run_proc(table_cmd))
+            tasks.append(run_proc(table_cmd, timeout=table_timeout_s))
         else:
             tasks.append(asyncio.sleep(0, result={"exit": 0, "stdout": "", "stderr": ""}))
 
         if include_images:
-            tasks.append(run_proc(image_cmd))
+            tasks.append(run_proc(image_cmd, timeout=image_timeout_s))
         else:
             tasks.append(asyncio.sleep(0, result={"exit": 0, "stdout": "", "stderr": ""}))
 
@@ -321,7 +330,8 @@ async def extract_all(
                         log.error("CSV read error %s: %s", csv_path, e)
                 table_url = None
                 if os.path.exists(csv_path):
-                    table_url = maybe_upload_csv_to_supabase(t["filename"], t["filename"])  # stored under tables/<filename>
+                    # store as tables/<filename> in the same bucket
+                    table_url = maybe_upload_csv_to_supabase(csv_path, t["filename"])
                 results.append({
                     "type": "table",
                     "page": t.get("page_number", 0),
@@ -397,20 +407,23 @@ async def extract_all(
             pass
 
 # --------------------------------------------------------------------------------------
-# Convenience wrappers (optional): separate endpoints that call the same engine
+# Convenience wrappers (delegate to /extract/all with your new timeout knobs)
 # --------------------------------------------------------------------------------------
 @app.post("/extract/tables")
 async def extract_tables_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 8,
+    workers: int = 4,
     page_limit: Optional[int] = None,
+    table_timeout_s: int = 900,
+    no_verification: bool = False,
     token: bool = Depends(verify),
 ):
-    # Delegate to /extract/all but with images disabled
     return await extract_all(
-        file=file, min_quality=min_quality, workers=workers,
-        page_limit=page_limit, include_images=False, include_tables=True,
+        file=file, min_quality=min_quality, workers=workers, page_limit=page_limit,
+        include_images=False, include_tables=True,
+        table_timeout_s=table_timeout_s, image_timeout_s=900,
+        no_verification=no_verification,
         token=token
     )
 
@@ -418,17 +431,18 @@ async def extract_tables_only(
 async def extract_images_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 8,
+    workers: int = 4,
     min_width: int = 100,
     min_height: int = 100,
     page_limit: Optional[int] = None,
+    image_timeout_s: int = 900,
     token: bool = Depends(verify),
 ):
-    # Delegate to /extract/all but with tables disabled
     return await extract_all(
         file=file, min_quality=min_quality, workers=workers,
-        min_width=min_width, min_height=min_height,
-        page_limit=page_limit, include_images=True, include_tables=False,
+        min_width=min_width, min_height=min_height, page_limit=page_limit,
+        include_images=True, include_tables=False,
+        table_timeout_s=900, image_timeout_s=image_timeout_s,
         token=token
     )
 
