@@ -155,7 +155,7 @@ async def test_extraction(
 async def extract_all(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     min_width: int = 100,
     min_height: int = 100,
     # LIMITERS (optional)
