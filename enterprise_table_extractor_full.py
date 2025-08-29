@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Enterprise PDF Table Extractor v1.1+ (Complete Production Version) - TESTING VERSION
-- TESTING ONLY: Early exit after N tables for speed
+Enterprise PDF Table Extractor v1.1+ (Complete Production Version)
+FIXES:
+- Original filename collision bug (uses table_info['table_index'] + method suffix)
+- Quality filtering is optional (--enforce-quality-filter flag)
+- No tables lost during extraction
+NEW:
 - Parallel processing with ThreadPoolExecutor
 - Atomic CSV writes with validation
 - Comprehensive file verification
 - Thread-safe operations
 - Progress tracking
+PRESERVES:
+- Full TableClassifier (9 categories for financial/scientific documents)
+- Complete QualityAnalyzer (5 metrics)
+- All metadata extraction capabilities
+- Multi-method extraction (pdfplumber, camelot, tabula, etc.)
 """
 
 import pdfplumber
@@ -113,7 +122,7 @@ class TableClassifier:
             'scientific_data': {
                 'keywords': ['experiment', 'sample', 'control', 'mean', 'std', 'p-value', 
                            'significant', 'correlation', 'n=', 'error', 'ci', 'confidence'],
-                'patterns': [r'Â±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*Â±\s*\d+\.\d+', 
+                'patterns': [r'Ã‚Â±', r'p\s*[<=]\s*0\.\d+', r'\d+\.\d+\s*Ã‚Â±\s*\d+\.\d+', 
                            r'r\s*=\s*[0-9.-]+', r'n\s*=\s*\d+'],
                 'metadata_extractors': ['units', 'statistical_measures', 'sample_size', 'p_values']
             },
@@ -186,7 +195,7 @@ class TableClassifier:
         if 'statistical_measures' in config.get('metadata_extractors', []):
             text = str(table_data)
             metadata['has_p_values'] = bool(re.search(r'p\s*[<=]\s*0\.\d+', text))
-            metadata['has_error_bars'] = bool(re.search(r'Â±', text))
+            metadata['has_error_bars'] = bool(re.search(r'Ã‚Â±', text))
             metadata['has_confidence_intervals'] = bool(re.search(r'(CI|confidence\s*interval)', text, re.I))
         
         if 'fiscal_period' in config.get('metadata_extractors', []):
@@ -201,7 +210,7 @@ class TableClassifier:
     def _detect_currency(table_data):
         """Detect currency in table"""
         currencies = {
-            '$': 'USD', 'â‚¬': 'EUR', 'Â£': 'GBP', 'Â¥': 'JPY', 'CHF': 'CHF',
+            '$': 'USD', 'Ã¢â€šÂ¬': 'EUR', 'Ã‚Â£': 'GBP', 'Ã‚Â¥': 'JPY', 'CHF': 'CHF',
             'Rs': 'INR', 'R$': 'BRL', 'C$': 'CAD', 'A$': 'AUD', 'HK$': 'HKD'
         }
         
@@ -218,8 +227,8 @@ class TableClassifier:
             # Financial
             r'million', r'billion', r'thousand', r'mn', r'bn', r'k',
             # Scientific
-            r'mg/ml', r'Î¼g/ml', r'ng/ml', r'mM', r'Î¼M', r'nM',
-            r'kDa', r'Da', r'Â°C', r'Â°F', r'K',
+            r'mg/ml', r'ÃŽÂ¼g/ml', r'ng/ml', r'mM', r'ÃŽÂ¼M', r'nM',
+            r'kDa', r'Da', r'Ã‚Â°C', r'Ã‚Â°F', r'K',
             # ESG
             r'tCO2e?', r'MWh', r'GWh', r'GJ', r'TJ',
             # General
@@ -391,7 +400,7 @@ class QualityAnalyzer:
             return 0.8
 
 class EnterpriseTableExtractor:
-    """Enterprise-grade PDF table extractor with parallel processing - TESTING VERSION"""
+    """Enterprise-grade PDF table extractor with parallel processing"""
     
     def __init__(self, pdf_path: str, output_dir: str = "/data/pdf_tables",
                  config: Optional[Dict] = None):
@@ -402,24 +411,14 @@ class EnterpriseTableExtractor:
         # Configuration
         self.config = config or {}
         self.min_quality_score = self.config.get('min_quality_score', 0.3)
-        # OPTIMIZED: Use all available CPUs up to 16 for Professional plan
-        self.max_workers = self.config.get('max_workers', min(16, os.cpu_count() or 1))
-        self.page_limit = self.config.get('page_limit', None)  # Add page limit support for testing
+        self.max_workers = self.config.get('max_workers', min(9, os.cpu_count() or 1))
         self.save_metadata = self.config.get('save_metadata', True)
         self.enforce_quality_filter = self.config.get('enforce_quality_filter', False)
         self.enable_verification = self.config.get('enable_verification', True)
         
-        # TESTING ONLY - Early exit limiter
-        self.testing_table_limit = int(os.environ.get('TESTING_TABLE_LIMIT', '0'))
-        if self.testing_table_limit > 0:
-            logger.info(f"[TESTING MODE] Will stop after extracting {self.testing_table_limit} tables")
-        
         # Results storage (thread-safe)
         self.extracted_tables: List[TableMetadata] = []
         self._tables_lock = threading.Lock()
-        
-        # TESTING ONLY - Early exit flag
-        self._should_stop_extraction = False
         
         self.extraction_stats = {
             'total_pages': 0,
@@ -430,9 +429,7 @@ class EnterpriseTableExtractor:
             'total_extraction_time': 0,
             'pages_processed': 0,
             'extraction_errors': [],
-            'tables_filtered_by_quality': 0,
-            'testing_mode': self.testing_table_limit > 0,
-            'testing_limit_reached': False
+            'tables_filtered_by_quality': 0
         }
         
         # Internal counters to avoid filename collisions
@@ -447,7 +444,7 @@ class EnterpriseTableExtractor:
         try:
             with pdfplumber.open(self.pdf_path) as pdf:
                 self.extraction_stats['total_pages'] = len(pdf.pages)
-                logger.info(f"[DIAGNOSTICS] Initialized PDF: {self.pdf_path.name} "
+                logger.info(f"Initialized PDF: {self.pdf_path.name} "
                           f"({self.extraction_stats['total_pages']} pages)")
         except Exception as e:
             logger.error(f"Failed to open PDF: {e}")
@@ -496,35 +493,19 @@ class EnterpriseTableExtractor:
             return False
     
     def extract_all_tables(self):
-        """Main extraction method with parallel processing - TESTING VERSION"""
+        """Main extraction method with parallel processing"""
         start_time = datetime.now()
         
-        # TESTING DIAGNOSTICS AND LIMITERS
-        logger.info(f"[DIAGNOSTICS] TESTING_TABLE_LIMIT env var: {os.environ.get('TESTING_TABLE_LIMIT', 'NOT SET')}")
-        logger.info(f"[DIAGNOSTICS] Parsed testing_table_limit: {self.testing_table_limit}")
-        
-        if self.testing_table_limit > 0:
-            logger.info(f"[TESTING MODE] Will stop after extracting {self.testing_table_limit} tables")
-            self._should_stop_extraction = False
-        else:
-            logger.info(f"[PRODUCTION MODE] No testing limit set - will process all tables")
-        
-        logger.info(f"[DIAGNOSTICS] Starting parallel extraction with {self.max_workers} workers")
-        logger.info(f"[DIAGNOSTICS] Processing {self.extraction_stats['total_pages']} pages")
+        logger.info(f"Starting parallel extraction with {self.max_workers} workers")
+        logger.info(f"Processing {self.extraction_stats['total_pages']} pages")
         logger.info(f"Quality filter: {'ENABLED' if self.enforce_quality_filter else 'DISABLED'}")
-        
-        # Determine pages to process
-        total_pages = self.extraction_stats['total_pages']
-        if self.page_limit:
-            total_pages = min(self.page_limit, total_pages)
-            logger.info(f"Page limit set: processing first {total_pages} pages only")
         
         # Process pages in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit pages up to limit
+            # Submit all pages
             future_to_page = {
                 executor.submit(self._process_page_safe, page_num): page_num
-                for page_num in range(1, total_pages + 1)
+                for page_num in range(1, self.extraction_stats['total_pages'] + 1)
             }
             
             # Process results as they complete
@@ -533,38 +514,17 @@ class EnterpriseTableExtractor:
                 page_num = future_to_page[future]
                 processed_pages += 1
                 
-                # TESTING ONLY - Check early exit
-                if self._should_stop_extraction:
-                    logger.info(f"[TESTING MODE] Early exit triggered - cancelling remaining pages")
-                    # Cancel remaining futures
-                    for remaining_future in future_to_page:
-                        if not remaining_future.done():
-                            remaining_future.cancel()
-                    break
-                
                 # Progress update
-                if processed_pages % 10 == 0 or processed_pages == total_pages:
-                    progress = (processed_pages / total_pages) * 100
-                    logger.info(f"[DIAGNOSTICS] Progress: {processed_pages}/{total_pages} pages ({progress:.1f}%)")
+                if processed_pages % 10 == 0 or processed_pages == self.extraction_stats['total_pages']:
+                    progress = (processed_pages / self.extraction_stats['total_pages']) * 100
+                    logger.info(f"Progress: {processed_pages}/{self.extraction_stats['total_pages']} pages ({progress:.1f}%)")
                 
                 try:
                     page_tables = future.result()
                     if page_tables:
                         self.extraction_stats['pages_with_tables'] += 1
-                        logger.info(f"[DIAGNOSTICS] Page {page_num} found {len(page_tables)} tables")
                         for table_info in page_tables:
                             self._save_table(table_info)
-                            
-                            # TESTING ONLY - Check if we should stop
-                            if self._should_stop_extraction:
-                                logger.info(f"[TESTING MODE] Breaking from table processing loop")
-                                break
-                        
-                        if self._should_stop_extraction:
-                            break
-                    else:
-                        logger.debug(f"[DIAGNOSTICS] Page {page_num} found no tables")
-                            
                 except Exception as e:
                     logger.error(f"Failed to process page {page_num}: {e}")
                     self.extraction_stats['extraction_errors'].append({
@@ -590,12 +550,9 @@ class EnterpriseTableExtractor:
         if self.save_metadata:
             self._save_extraction_metadata()
         
-        logger.info(f"[DIAGNOSTICS] Extraction complete: {len(self.extracted_tables)} tables extracted in {self.extraction_stats['total_extraction_time']:.1f}s")
+        logger.info(f"Extraction complete: {len(self.extracted_tables)} tables extracted in {self.extraction_stats['total_extraction_time']:.1f}s")
         if self.enforce_quality_filter and self.extraction_stats['tables_filtered_by_quality'] > 0:
             logger.info(f"Tables filtered by quality: {self.extraction_stats['tables_filtered_by_quality']}")
-        
-        if self.testing_table_limit > 0:
-            logger.info(f"[TESTING MODE] Limit was {self.testing_table_limit}, extracted {len(self.extracted_tables)}")
         
         return self.extracted_tables
     
@@ -609,13 +566,7 @@ class EnterpriseTableExtractor:
     
     def _process_page(self, page_num: int) -> List[Dict]:
         """Process a single page with multiple extraction methods"""
-        
-        # TESTING ONLY - Check early exit
-        if self._should_stop_extraction:
-            logger.info(f"[TESTING MODE] Skipping page {page_num} due to early exit")
-            return []
-            
-        logger.debug(f"[DIAGNOSTICS] Processing page {page_num}")
+        logger.debug(f"Processing page {page_num}")
         
         all_tables = []
         
@@ -629,21 +580,10 @@ class EnterpriseTableExtractor:
         ]
         
         for method_name, method_func in extraction_methods:
-            
-            # TESTING ONLY - Check early exit before each method
-            if self._should_stop_extraction:
-                logger.info(f"[TESTING MODE] Breaking from extraction methods on page {page_num}")
-                break
-                
             try:
                 tables = method_func(page_num)
                 
                 for table_idx, table_data in enumerate(tables):
-                    
-                    # TESTING ONLY - Check early exit for each table
-                    if self._should_stop_extraction:
-                        break
-                        
                     if self._is_valid_table(table_data):
                         # Clean and enhance table
                         cleaned_table = self._clean_table_data(table_data)
@@ -678,14 +618,10 @@ class EnterpriseTableExtractor:
                         }
                         
                         all_tables.append(table_info)
-                        logger.debug(f"[DIAGNOSTICS] Page {page_num} table {len(all_tables)}: {table_type}, quality {quality_score:.2f}")
                         
                         # Update statistics
                         with self._tables_lock:
                             self.extraction_stats['extraction_methods_used'][method_name] += 1
-                
-                if self._should_stop_extraction:
-                    break
                             
             except Exception as e:
                 logger.debug(f"Method {method_name} failed on page {page_num}: {e}")
@@ -719,11 +655,6 @@ class EnterpriseTableExtractor:
             ]
             
             for setting in settings:
-                
-                # TESTING ONLY - Check early exit
-                if self._should_stop_extraction:
-                    break
-                    
                 extracted = page.extract_tables(table_settings=setting)
                 for table in extracted:
                     if table and self._is_valid_table(table):
@@ -733,7 +664,7 @@ class EnterpriseTableExtractor:
     
     def _extract_with_camelot_lattice(self, page_num: int) -> List[List[List[Any]]]:
         """Extract tables using Camelot (lattice mode for bordered tables)"""
-        if not HAS_CAMELOT or self._should_stop_extraction:
+        if not HAS_CAMELOT:
             return []
         
         try:
@@ -750,7 +681,7 @@ class EnterpriseTableExtractor:
     
     def _extract_with_camelot_stream(self, page_num: int) -> List[List[List[Any]]]:
         """Extract tables using Camelot (stream mode for borderless tables)"""
-        if not HAS_CAMELOT or self._should_stop_extraction:
+        if not HAS_CAMELOT:
             return []
         
         try:
@@ -767,7 +698,7 @@ class EnterpriseTableExtractor:
     
     def _extract_with_tabula(self, page_num: int) -> List[List[List[Any]]]:
         """Extract tables using Tabula"""
-        if not HAS_TABULA or self._should_stop_extraction:
+        if not HAS_TABULA:
             return []
         
         try:
@@ -783,9 +714,6 @@ class EnterpriseTableExtractor:
                 pandas_options={'header': None}
             )
             tables_list.extend([table.values.tolist() for table in tables])
-            
-            if self._should_stop_extraction:
-                return tables_list
             
             # Stream method
             tables = tabula.read_pdf(
@@ -803,7 +731,7 @@ class EnterpriseTableExtractor:
     
     def _extract_with_pymupdf(self, page_num: int) -> List[List[List[Any]]]:
         """Extract tables using PyMuPDF (placeholder for future implementation)"""
-        if not HAS_PYMUPDF or self._should_stop_extraction:
+        if not HAS_PYMUPDF:
             return []
         
         try:
@@ -885,19 +813,7 @@ class EnterpriseTableExtractor:
         return unique_tables
     
     def _save_table(self, table_info: Dict):
-        """Save table to CSV file with atomic write - TESTING VERSION"""
-        
-        # TESTING ONLY - Check if we should stop before saving
-        if self.testing_table_limit > 0:
-            current_count = len(self.extracted_tables)
-            logger.info(f"[TESTING DIAGNOSTICS] Current table count: {current_count}, Limit: {self.testing_table_limit}")
-            
-            if current_count >= self.testing_table_limit:
-                logger.info(f"[TESTING MODE] Reached limit of {self.testing_table_limit} tables - stopping extraction")
-                self._should_stop_extraction = True
-                self.extraction_stats['testing_limit_reached'] = True
-                return  # Skip saving this table
-        
+        """Save table to CSV file with atomic write - FIXED VERSION"""
         page_num = table_info['page']
         # Use the pre-calculated index from table_info
         table_idx = table_info.get('table_index')
@@ -966,7 +882,7 @@ class EnterpriseTableExtractor:
                 
                 self.extraction_stats['table_types_found'][metadata.table_type] += 1
             
-            logger.info(f"[DIAGNOSTICS] Saved {filename} - Type: {metadata.table_type}, "
+            logger.debug(f"Saved {filename} - Type: {metadata.table_type}, "
                        f"Quality: {metadata.quality_score:.2f}, "
                        f"Rows: {metadata.rows}, Cols: {metadata.columns}")
             
@@ -1105,9 +1021,7 @@ class EnterpriseTableExtractor:
                 'max_workers': self.max_workers,
                 'min_quality_score': self.min_quality_score,
                 'enforce_quality_filter': self.enforce_quality_filter,
-                'enable_verification': self.enable_verification,
-                'page_limit': self.page_limit,
-                'testing_table_limit': self.testing_table_limit
+                'enable_verification': self.enable_verification
             },
             'statistics': dict(self.extraction_stats),
             'tables': [asdict(table) for table in self.extracted_tables]
@@ -1128,7 +1042,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Enterprise PDF Table Extractor v1.1+ (Complete Production Version) - TESTING VERSION'
+        description='Enterprise PDF Table Extractor v1.1+ (Complete Production Version)'
     )
     parser.add_argument('pdf_path', help='Path to PDF file')
     parser.add_argument(
@@ -1163,18 +1077,12 @@ def main():
         action='store_true',
         help='Skip file verification step'
     )
-    parser.add_argument(
-        '--page-limit',
-        type=int,
-        default=None,
-        help='Limit extraction to first N pages (for testing)'
-    )
     
     args = parser.parse_args()
     
     # Auto-detect optimal workers
     if args.workers == 0:
-        args.workers = min(16, os.cpu_count() or 1)
+        args.workers = min(9, os.cpu_count() or 1)
         logger.info(f"Auto-detected {args.workers} workers")
     
     # Configuration
@@ -1183,8 +1091,7 @@ def main():
         'min_quality_score': args.min_quality,
         'save_metadata': True,
         'enforce_quality_filter': args.enforce_quality_filter,
-        'enable_verification': not args.no_verification,
-        'page_limit': args.page_limit
+        'enable_verification': not args.no_verification
     }
     
     # Clear output directory if requested
@@ -1206,7 +1113,7 @@ def main():
     
     # Print summary
     print("\n" + "="*60)
-    print("EXTRACTION SUMMARY - TESTING VERSION")
+    print("EXTRACTION SUMMARY")
     print("="*60)
     print(f"Total pages processed: {extractor.extraction_stats['total_pages']}")
     print(f"Pages with tables: {extractor.extraction_stats['pages_with_tables']}")
@@ -1214,10 +1121,6 @@ def main():
     print(f"Extraction time: {extractor.extraction_stats['total_extraction_time']:.2f}s")
     print(f"Parallel workers used: {config['max_workers']}")
     print(f"Pages/second: {extractor.extraction_stats['total_pages'] / extractor.extraction_stats['total_extraction_time']:.1f}")
-    
-    if extractor.testing_table_limit > 0:
-        print(f"[TESTING MODE] Limit was {extractor.testing_table_limit}, extracted {len(tables)}")
-        print(f"[TESTING MODE] Limit reached: {extractor.extraction_stats['testing_limit_reached']}")
     
     if extractor.extraction_stats['extraction_errors']:
         print(f"\nExtraction errors: {len(extractor.extraction_stats['extraction_errors'])}")
