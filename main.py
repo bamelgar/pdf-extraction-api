@@ -34,7 +34,7 @@ WHY THIS MATTERS FOR YOUR WORKFLOW
 
 TUNING & DEFAULTS (RENDER PROFESSIONAL)
 ---------------------------------------
-• Recommended `workers`: **6–8** to avoid CPU thrash; 16 is often slower on small/medium instances.
+• Recommended ``: **6–8** to avoid CPU thrash; 16 is often slower on small/medium instances.
 • Avoid `page_limit` during real runs (10-Ks often have late tables). Use it only for debugging.
 • `min_quality` 0.3 is a sensible floor for both modalities to reduce junk without dropping valid content.
 
@@ -72,7 +72,7 @@ TROUBLESHOOTING CHECKLIST
   - Check Render logs for extractor exit codes and stderr snippets.
 
 • If **timeouts** occur:
-  - Lower `workers` to 6–8.
+  - Lower `` to 6–8.
   - Temporarily set a small `page_limit` for debugging only.
   - Verify Java presence at `/debug/check-environment` (Tabula needs it).
 
@@ -248,7 +248,7 @@ async def extract_all(
     file: UploadFile = File(...),
     # shared knobs
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     page_limit: Optional[int] = None,
     # image-only knobs
     min_width: int = 100,
@@ -413,7 +413,7 @@ async def extract_all(
 async def extract_tables_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     page_limit: Optional[int] = None,
     table_timeout_s: int = 900,
     no_verification: bool = False,
@@ -431,7 +431,7 @@ async def extract_tables_only(
 async def extract_images_only(
     file: UploadFile = File(...),
     min_quality: float = 0.3,
-    workers: int = 4,
+    workers: int = 8,
     min_width: int = 100,
     min_height: int = 100,
     page_limit: Optional[int] = None,
