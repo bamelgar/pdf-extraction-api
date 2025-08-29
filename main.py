@@ -19,6 +19,9 @@ WHAT THIS VERSION DOES (AT A GLANCE)
 5) Provides **runtime toggles** to test modalities without code edits:
    - Query params: include_images={true|false}, include_tables={true|false}
    - Example (tables only):  /extract/all?include_images=false&include_tables=true
+6) Adds **convenience wrapper endpoints** that delegate to /extract/all:
+   - /extract/tables  → runs tables only (images off)
+   - /extract/images  → runs images only (tables off)
 
 WHY THIS MATTERS FOR YOUR WORKFLOW
 ----------------------------------
@@ -40,8 +43,17 @@ ENV VARS & BEHAVIOR SWITCHES
 • API_KEY                 : Simple Bearer auth for n8n HTTP Request node.
 • SUPABASE_URL            : (images path already uses Supabase; used here only if you enable table CSV uploads)
 • SUPABASE_TOKEN          : (same as above)
-• SUPABASE_BUCKET         : defaults to "public-images" (images). CSVs (if enabled) go to "tables/<filename>" within the same bucket.
+• SUPABASE_BUCKET         : defaults to "public-images" (images). CSVs (if enabled) are stored under "tables/<filename>" in the same bucket.
 • UPLOAD_TABLE_CSVS       : "true"/"1" to enable optional table CSV uploads; **default false** (return `csv_content` as usual).
+
+STARTUP LOGGING & DEBUG VISIBILITY
+----------------------------------
+• On boot, logs the following so you can verify config **without** hitting an endpoint:
+  - “Tables enabled: YES…”
+  - `UPLOAD_TABLE_CSVS=<True|False>`
+  - Whether `SUPABASE_URL` is set and the bucket name
+  - Java/Tesseract availability
+• `/debug/check-environment` returns `env_flags` including `UPLOAD_TABLE_CSVS`, and shows script presence + Java/Tesseract checks.
 
 COMPATIBILITY & NON-BREAKING GUARANTEES
 ---------------------------------------
@@ -49,13 +61,14 @@ COMPATIBILITY & NON-BREAKING GUARANTEES
   - **Tables**: still provide `csv_content`.
   - **Images**: Supabase URL fields (`supabase_url`, `image_url`, `url`, `uploaded_filename`) are preserved if present.
 • Sorting is still by (page, index) to keep deterministic ordering.
+• Fail-soft behavior: if one extractor exits non-zero, the other modality’s results are still returned (logged in stderr).
 
 TROUBLESHOOTING CHECKLIST
 -------------------------
 • If **no tables** arrive downstream:
   - Confirm root ("/") shows `"TABLES_ENABLED": "YES..."`.
   - Ensure your n8n HTTP node **does not** send `page_limit=100` for long filings.
-  - Use the tables-only toggle: include_images=false&include_tables=true.
+  - Use the tables-only toggle: include_images=false&include_tables=true (or call /extract/tables).
   - Check Render logs for extractor exit codes and stderr snippets.
 
 • If **timeouts** occur:
@@ -69,26 +82,32 @@ Per your directive: **Image extraction logic and Supabase image storage behavior
 All changes here are confined to:
   (a) **concurrency orchestration** around the two subprocesses,
   (b) adding **optional** CSV→Supabase for tables (non-breaking),
-  (c) adding **runtime toggles** for selective execution.
+  (c) adding **runtime toggles** for selective execution,
+  (d) startup logging so Render shows UPLOAD_TABLE_CSVS state immediately.
 """
 
-# main.py  — concurrent tables+images, optional CSV upload (tables keep csv_content)
+
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import os, sys, json, base64, shutil, tempfile, logging, asyncio, hashlib
+import os, sys, json, base64, shutil, tempfile, logging, asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-# ---------- App & CORS ----------
-app = FastAPI(title="PDF Extraction API", version="1.1.0")
+# --------------------------------------------------------------------------------------
+# App & CORS
+# --------------------------------------------------------------------------------------
+app = FastAPI(title="PDF Extraction API", version="1.2.0")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---------- Auth ----------
+# --------------------------------------------------------------------------------------
+# Auth
+# --------------------------------------------------------------------------------------
 security = HTTPBearer()
 API_KEY = os.environ.get("API_KEY", "your-secret-api-key-change-this")
 def verify(creds: HTTPAuthorizationCredentials = Security(security)):
@@ -96,39 +115,45 @@ def verify(creds: HTTPAuthorizationCredentials = Security(security)):
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return True
 
-# ---------- Logging ----------
+# --------------------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("main")
 
-# ---------- Supabase config (reused for images; CSV upload is OPTIONAL) ----------
-SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
-SUPABASE_TOKEN = os.environ.get("SUPABASE_TOKEN", "")
-SUPABASE_BUCKET= os.environ.get("SUPABASE_BUCKET", "public-images")
-UPLOAD_TABLE_CSVS = os.environ.get("UPLOAD_TABLE_CSVS", "false").lower() in {"1","true","yes"}
+def _now() -> str:
+    return datetime.now().isoformat()
 
-# Graceful optional dependency
+# --------------------------------------------------------------------------------------
+# Supabase config (images path remains as-is; CSV upload for tables is OPTIONAL)
+# --------------------------------------------------------------------------------------
+SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
+SUPABASE_TOKEN  = os.environ.get("SUPABASE_TOKEN", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "public-images")
+UPLOAD_TABLE_CSVS = os.environ.get("UPLOAD_TABLE_CSVS", "false").lower() in {"1", "true", "yes"}
+
+# Lazy import for CSV uploads
 try:
-    import requests  # used only if UPLOAD_TABLE_CSVS=true
+    import requests  # only needed if UPLOAD_TABLE_CSVS is true
 except Exception:
     requests = None
 
-# ---------- Helpers ----------
-def now_iso() -> str:
-    return datetime.now().isoformat()
+# ----- Startup logging (show critical env flags without hitting debug endpoint) -----
+log.info("=== PDF Extraction API starting ===")
+log.info("Tables enabled: YES (full functionality with limiter version)")
+log.info("UPLOAD_TABLE_CSVS=%s", UPLOAD_TABLE_CSVS)
+log.info("SUPABASE_URL set: %s | bucket=%s", bool(SUPABASE_URL), SUPABASE_BUCKET)
+log.info("Java available: %s", bool(shutil.which("java")))
+log.info("Tesseract available: %s", bool(shutil.which("tesseract")))
 
-def bool_param(v: Optional[str], default: bool) -> bool:
-    if v is None: return default
-    return str(v).lower() in {"1","true","yes","y","on"}
-
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
 async def run_proc(cmd: List[str], timeout: int = 300) -> Dict[str, Any]:
-    """
-    Run a subprocess asynchronously. Returns {exit, stdout, stderr}.
-    """
+    """Run a subprocess asynchronously. Returns {'exit','stdout','stderr'}."""
     log.info("Running: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -152,17 +177,16 @@ def safe_json_read(path: str, default: Any) -> Any:
 def maybe_upload_csv_to_supabase(csv_path: str, dest_name: str) -> Optional[str]:
     """
     OPTIONAL helper: upload table CSV to Supabase Storage.
-    - Only used if UPLOAD_TABLE_CSVS=true and requests + SUPABASE creds are present.
-    - Returns a public URL if upload succeeds, else None.
+    - Controlled by UPLOAD_TABLE_CSVS env (default false)
+    - Returns a public URL if successful; None otherwise
     """
     if not UPLOAD_TABLE_CSVS:
         return None
     if not (requests and SUPABASE_URL and SUPABASE_TOKEN and SUPABASE_BUCKET):
-        log.info("CSV upload skipped (missing deps or creds).")
+        log.info("CSV upload skipped (missing requests or Supabase creds).")
         return None
     try:
-        # Supabase Storage HTTP path: /storage/v1/object/<bucket>/<name>
-        url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{dest_name}"
+        url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/tables/{dest_name}"
         with open(csv_path, "rb") as f:
             data = f.read()
         headers = {
@@ -172,51 +196,64 @@ def maybe_upload_csv_to_supabase(csv_path: str, dest_name: str) -> Optional[str]
         }
         r = requests.post(url, headers=headers, data=data, timeout=60)
         if r.status_code in (200, 201):
-            # Public URL (if bucket is public)
-            public = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/{dest_name}"
+            public = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/tables/{dest_name}"
             return public
-        else:
-            log.warning("CSV upload failed %s: %s", r.status_code, r.text[:200])
-            return None
+        log.warning("CSV upload failed status=%s body=%s", r.status_code, r.text[:200])
+        return None
     except Exception as e:
         log.warning("CSV upload error: %s", e)
         return None
 
-# ---------- Health ----------
+# --------------------------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------------------------
 @app.get("/")
 async def root():
     return {
         "status": "healthy",
         "service": "PDF Extraction API",
-        "version": "1.1.0",
-        "timestamp": now_iso(),
+        "version": "1.2.0",
+        "timestamp": _now(),
         "TABLES_ENABLED": "YES - Full functionality with limiter version",
     }
 
 @app.get("/debug/check-environment")
-async def check_env():
+async def check_environment():
     checks = {
-        "python": sys.version,
+        "python_version": sys.version,
+        "current_directory": os.getcwd(),
         "scripts_exist": {
             "table_extractor": os.path.exists("enterprise_table_extractor_full.py"),
             "image_extractor": os.path.exists("enterprise_image_extractor.py"),
         },
-        "java_available": shutil.which("java") is not None,
-        "tesseract_available": shutil.which("tesseract") is not None,
+        "system_checks": {
+            "java_available": shutil.which("java") is not None,
+            "tesseract_available": shutil.which("tesseract") is not None,
+        },
+        "env_flags": {
+            "UPLOAD_TABLE_CSVS": os.environ.get("UPLOAD_TABLE_CSVS", "false"),
+            "SUPABASE_URL_set": bool(SUPABASE_URL),
+            "SUPABASE_BUCKET": SUPABASE_BUCKET,
+        },
     }
     return checks
 
-# ---------- Core: /extract/all (concurrent) ----------
+# --------------------------------------------------------------------------------------
+# Core: /extract/all  (concurrent orchestration)
+# --------------------------------------------------------------------------------------
 @app.post("/extract/all")
 async def extract_all(
     file: UploadFile = File(...),
+    # shared knobs
     min_quality: float = 0.3,
     workers: int = 4,
+    page_limit: Optional[int] = None,
+    # image-only knobs
     min_width: int = 100,
     min_height: int = 100,
-    page_limit: Optional[int] = None,  # pass to table/image extractors if provided
-    include_images: Optional[bool] = True,     # runtime toggle
-    include_tables: Optional[bool] = True,     # runtime toggle
+    # toggles
+    include_images: Optional[bool] = True,
+    include_tables: Optional[bool] = True,
     token: bool = Depends(verify),
 ):
     temp_dir = tempfile.mkdtemp()
@@ -224,12 +261,13 @@ async def extract_all(
         pdf_path = os.path.join(temp_dir, "input.pdf")
         with open(pdf_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
+
         tables_dir = os.path.join(temp_dir, "pdf_tables")
         images_dir = os.path.join(temp_dir, "pdf_images")
         os.makedirs(tables_dir, exist_ok=True)
         os.makedirs(images_dir, exist_ok=True)
 
-        # ---- Build commands (limiter flags preserved) ----
+        # ----- Build commands (limiter flags preserved) -----
         table_cmd = [
             sys.executable, "enterprise_table_extractor_full.py", pdf_path,
             "--output-dir", tables_dir,
@@ -238,7 +276,7 @@ async def extract_all(
             "--clear-output",
         ]
         if page_limit and int(page_limit) > 0:
-            table_cmd += ["--page-limit", str(int(page_limit))]  # keeps limiter intact
+            table_cmd += ["--page-limit", str(int(page_limit))]
 
         image_cmd = [
             sys.executable, "enterprise_image_extractor.py", pdf_path,
@@ -251,14 +289,15 @@ async def extract_all(
             "--clear-output",
         ]
         if page_limit and int(page_limit) > 0:
-            image_cmd += ["--page-limit", str(int(page_limit))]  # keeps limiter intact
+            image_cmd += ["--page-limit", str(int(page_limit))]
 
-        # ---- Concurrency: launch selected extractors in parallel ----
+        # ----- Launch concurrently (respect toggles) -----
         tasks = []
         if include_tables:
             tasks.append(run_proc(table_cmd))
         else:
             tasks.append(asyncio.sleep(0, result={"exit": 0, "stdout": "", "stderr": ""}))
+
         if include_images:
             tasks.append(run_proc(image_cmd))
         else:
@@ -266,11 +305,11 @@ async def extract_all(
 
         table_res, image_res = await asyncio.gather(*tasks)
 
-        # ---- Package TABLE results (keep csv_content; optional CSV upload) ----
         results: List[Dict[str, Any]] = []
+
+        # ----- Package TABLES (keep csv_content; optional table_url) -----
         if include_tables and table_res["exit"] == 0:
-            md_path = os.path.join(tables_dir, "extraction_metadata.json")
-            tmeta = safe_json_read(md_path, {})
+            tmeta = safe_json_read(os.path.join(tables_dir, "extraction_metadata.json"), {})
             for t in tmeta.get("tables", []):
                 csv_path = os.path.join(tables_dir, t["filename"])
                 csv_content = ""
@@ -280,14 +319,9 @@ async def extract_all(
                             csv_content = cf.read()
                     except Exception as e:
                         log.error("CSV read error %s: %s", csv_path, e)
-                # Optional CSV → Supabase upload
                 table_url = None
                 if os.path.exists(csv_path):
-                    dest_name = f"tables/{t['filename']}"
-                    maybe = maybe_upload_csv_to_supabase(csv_path, dest_name)
-                    if maybe:
-                        table_url = maybe
-
+                    table_url = maybe_upload_csv_to_supabase(t["filename"], t["filename"])  # stored under tables/<filename>
                 results.append({
                     "type": "table",
                     "page": t.get("page_number", 0),
@@ -305,18 +339,16 @@ async def extract_all(
                     "empty_cell_percentage": t.get("empty_cell_percentage", 0),
                     "metadata": t.get("metadata", {}),
                     "mimeType": "text/csv",
-                    "csv_content": csv_content,            # <-- REQUIRED by your cloud n8n path
-                    "table_url": table_url,                # <-- OPTIONAL (Supabase), safe to ignore
+                    "csv_content": csv_content,     # REQUIRED by your n8n cloud path
+                    "table_url": table_url,         # OPTIONAL; safe for you to ignore
                 })
         elif include_tables and table_res["exit"] != 0:
             log.error("Table extractor failed: %s", table_res["stderr"][:1000])
 
-        # ---- Package IMAGE results (UNCHANGED behavior; preserves Supabase image path) ----
+        # ----- Package IMAGES (pass-through; Supabase fields preserved) -----
         if include_images and image_res["exit"] == 0:
-            imd_path = os.path.join(images_dir, "extraction_metadata.json")
-            imeta = safe_json_read(imd_path, {})
+            imeta = safe_json_read(os.path.join(images_dir, "extraction_metadata.json"), {})
             for img in imeta.get("images", []):
-                # Keep raw fields; your downstream expects supabase_url / uploaded_filename
                 item = {
                     "type": "image",
                     "page": img.get("page_number", 0),
@@ -337,8 +369,6 @@ async def extract_all(
                     "enhancement_applied": img.get("enhancement_applied", False),
                     "mimeType": "image/png",
                 }
-                # If your current image pipeline already uploads to Supabase in the extractor,
-                # those fields should be present in metadata. We just pass them through.
                 for k in ("supabase_url", "url", "image_url", "uploaded_filename"):
                     if k in img:
                         item[k] = img[k]
@@ -346,12 +376,12 @@ async def extract_all(
         elif include_images and image_res["exit"] != 0:
             log.error("Image extractor failed: %s", image_res["stderr"][:1000])
 
-        # ---- Sort and return (keeps your existing response shape) ----
+        # ----- Sort & return -----
         results.sort(key=lambda x: (x.get("page", 0), x.get("index", 0)))
         return {
             "results": results,
             "count": len(results),
-            "extraction_timestamp": now_iso(),
+            "extraction_timestamp": _now(),
             "success": True,
         }
 
@@ -365,3 +395,46 @@ async def extract_all(
             shutil.rmtree(temp_dir)
         except Exception:
             pass
+
+# --------------------------------------------------------------------------------------
+# Convenience wrappers (optional): separate endpoints that call the same engine
+# --------------------------------------------------------------------------------------
+@app.post("/extract/tables")
+async def extract_tables_only(
+    file: UploadFile = File(...),
+    min_quality: float = 0.3,
+    workers: int = 4,
+    page_limit: Optional[int] = None,
+    token: bool = Depends(verify),
+):
+    # Delegate to /extract/all but with images disabled
+    return await extract_all(
+        file=file, min_quality=min_quality, workers=workers,
+        page_limit=page_limit, include_images=False, include_tables=True,
+        token=token
+    )
+
+@app.post("/extract/images")
+async def extract_images_only(
+    file: UploadFile = File(...),
+    min_quality: float = 0.3,
+    workers: int = 4,
+    min_width: int = 100,
+    min_height: int = 100,
+    page_limit: Optional[int] = None,
+    token: bool = Depends(verify),
+):
+    # Delegate to /extract/all but with tables disabled
+    return await extract_all(
+        file=file, min_quality=min_quality, workers=workers,
+        min_width=min_width, min_height=min_height,
+        page_limit=page_limit, include_images=True, include_tables=False,
+        token=token
+    )
+
+# --------------------------------------------------------------------------------------
+# Local dev entry
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
