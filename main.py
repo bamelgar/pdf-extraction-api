@@ -5,7 +5,7 @@ WHAT THIS IS
 ------------
 Drop-in `main.py` designed specifically for your n8n workflow. It preserves the
 **exact** image-extraction behavior (including Supabase uploads + URL return shape)
-from the working “main (limiter - 6)-Image Extraction WORKS.py” while adding:
+from the working "main (limiter - 6)-Image Extraction WORKS.py" while adding:
 - Clean `/extract/images` endpoint that uses the **same, proven** image block
 - `/extract/all` that keeps **tables OFF** (parity with limiter-6) and still uploads images to Supabase
 - `/extract/tables` that calls **enterprise_table_extractor_full.py** (required filename)
@@ -61,9 +61,9 @@ TIMEOUTS & CONCURRENCY GUIDANCE
 -------------------------------
 - Image extractor subprocess has a hard cap of 900s (15 minutes).
 - Tables use the `table_timeout_s` you send (default 900s).
-- Render’s shared CPU can throttle; start with workers=4 (safe), 6 if you need more,
-  and avoid 8+ unless you’re sure the instance has headroom. Match your n8n HTTP
-  node timeout to your largest expected run (20–30 min for 100+ page PDFs).
+- Render's shared CPU can throttle; start with workers=4 (safe), 6 if you need more,
+  and avoid 8+ unless you're sure the instance has headroom. Match your n8n HTTP
+  node timeout to your largest expected run (20—30 min for 100+ page PDFs).
 
 RESPONSE SHAPES (Stable for n8n)
 --------------------------------
@@ -146,6 +146,7 @@ import tempfile
 import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Header
@@ -331,58 +332,75 @@ def package_images_with_supabase(output_dir: str, timestamp: str, limit_images: 
         entries = entries[: max(0, int(limit_images))]
 
     log.info(f"Processing all {len(entries)} images")
-    results: List[Dict[str, Any]] = []
-    for m in entries:
-        fname = m["fileName"]
+    
+    # Parallel upload function
+    def upload_single_image(entry):
+        fname = entry["fileName"]
         fpath = os.path.join(output_dir, fname)
         if not os.path.isfile(fpath):
-            # Skip missing files
-            continue
-
-        # Build uploaded filename with timestamp prefix (matches your logs)
+            return None
         uploaded_name = f"{timestamp}_{fname}"
-
-        # Upload to Supabase (MANDATORY path in normal ops)
-        supa_ok, supa_url = supabase_upload_bytes(open(fpath, "rb").read(), uploaded_name, mime="image/png")
-
-        item: Dict[str, Any] = {
-            "type": "image",
-            "page": m.get("page"),
-            "index": m.get("index"),
-            "filePath": fpath,
-            "fileName": fname,
-            "image_type": m.get("image_type"),
-            "extraction_method": m.get("extraction_method"),
-            "quality_score": m.get("quality_score"),
-            "width": m.get("width"),
-            "height": m.get("height"),
-            "has_text": m.get("has_text"),
-            "text_content": m.get("text_content"),
-            "caption": m.get("caption"),
-            "figure_reference": m.get("figure_reference"),
-            "visual_elements": m.get("visual_elements"),
-            "vector_count": m.get("vector_count"),
-            "enhancement_applied": False,
-            "mimeType": "image/png",
-            # Supabase URL triplets (exact fields you rely on)
-            "supabase_url": supa_url if supa_ok else None,
-            "url": supa_url if supa_ok else None,
-            "image_url": supa_url if supa_ok else None,
-            "uploaded_filename": uploaded_name if supa_ok else None,
+        with open(fpath, "rb") as f:
+            data = f.read()
+        supa_ok, supa_url = supabase_upload_bytes(data, uploaded_name, mime="image/png")
+        return {
+            "entry": entry,
+            "fname": fname,
+            "fpath": fpath,
+            "uploaded_name": uploaded_name,
+            "supa_ok": supa_ok,
+            "supa_url": supa_url,
+            "data": data if not supa_ok else None
         }
-
-        if supa_ok and supa_url:
-            log.info(f"✅ Uploaded {uploaded_name} to Supabase")
-            log.info(f"✅ Image {fname} uploaded to Supabase: {supa_url}")
-        else:
-            # Fallback ONLY if Supabase is not configured or upload failed
-            # (this is how limiter-6 behaved when Supabase wasn’t present)
-            with open(fpath, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            item["base64_content"] = b64
-
-        results.append(item)
-
+    
+    # Parallel upload with ThreadPoolExecutor
+    results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(upload_single_image, entry) for entry in entries]
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+            
+            m = result["entry"]
+            item: Dict[str, Any] = {
+                "type": "image",
+                "page": m.get("page"),
+                "index": m.get("index"),
+                "filePath": result["fpath"],
+                "fileName": result["fname"],
+                "image_type": m.get("image_type"),
+                "extraction_method": m.get("extraction_method"),
+                "quality_score": m.get("quality_score"),
+                "width": m.get("width"),
+                "height": m.get("height"),
+                "has_text": m.get("has_text"),
+                "text_content": m.get("text_content"),
+                "caption": m.get("caption"),
+                "figure_reference": m.get("figure_reference"),
+                "visual_elements": m.get("visual_elements"),
+                "vector_count": m.get("vector_count"),
+                "enhancement_applied": False,
+                "mimeType": "image/png",
+                # Supabase URL triplets (exact fields you rely on)
+                "supabase_url": result["supa_url"] if result["supa_ok"] else None,
+                "url": result["supa_url"] if result["supa_ok"] else None,
+                "image_url": result["supa_url"] if result["supa_ok"] else None,
+                "uploaded_filename": result["uploaded_name"] if result["supa_ok"] else None,
+            }
+            
+            if result["supa_ok"] and result["supa_url"]:
+                log.info(f"✅ Uploaded {result['uploaded_name']} to Supabase")
+                log.info(f"✅ Image {result['fname']} uploaded to Supabase: {result['supa_url']}")
+            else:
+                # Fallback ONLY if Supabase is not configured or upload failed
+                if result["data"]:
+                    b64 = base64.b64encode(result["data"]).decode("utf-8")
+                    item["base64_content"] = b64
+                    log.warning(f"⚠️ Image {result['fname']} using base64 fallback")
+            
+            results.append(item)
+    
     return results
 
 # ------------------------------------------------------------------------------
@@ -620,6 +638,7 @@ def extract_tables(
             "--output-dir", out_dir,
             "--workers", str(tbl_workers),
             "--min-quality", str(min_quality),
+            "--clear-output",
         ]
         if page_start is not None:
             cmd += ["--page-start", str(page_start)]
@@ -755,3 +774,4 @@ def extract_all(
         }
         return JSONResponse(wrapper)
 
+  
