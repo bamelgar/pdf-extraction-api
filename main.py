@@ -4,7 +4,7 @@ PDF Extraction API (Drop-in)
 This file is a corrected, production-ready main.py that:
 - Preserves the exact, proven image-extraction behavior from your
   "main (limiter - 6)-Image Extraction WORKS.py" (including Supabase upload).
-- Forces workers=8 for images (per your instruction).
+- Forces workers=6 for images (per your instruction).
 - Returns the SAME response shape as your limiter-6 script (wrapped
   { results, count, extraction_timestamp, success } with slim image items).
 - Provides /extract/images (image-only) and /extract/tables (table-only),
@@ -50,8 +50,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")            # e.g., https://xxxx.su
 SUPABASE_TOKEN = os.environ.get("SUPABASE_TOKEN")        # service role or anon with storage perms
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "public-images")  # your working bucket
 
-# Hard clamp for images (your request): force workers=8 regardless of inputs
-FORCED_IMAGE_WORKERS = 8
+# Hard clamp for images (your request): force workers=6 regardless of inputs
+FORCED_IMAGE_WORKERS = 6
 
 security = HTTPBearer()
 
@@ -150,7 +150,7 @@ def run_image_extraction_block(
 ) -> dict:
     """
     EXACT functional behavior of your limiter-6 image block:
-    - Calls enterprise_image_extractor.py with forced workers=8
+    - Calls enterprise_image_extractor.py with forced workers=6
     - Reads metadata
     - Uploads images to Supabase with timestamp prefix
     - Packages a slim 'result_item' for each image with the same fields:
@@ -162,7 +162,7 @@ def run_image_extraction_block(
     images_dir = temp_dir / "pdf_images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    # NOTE: Force workers=8 per your requirement
+    # NOTE: Force workers=6 per your requirement
     eff_workers = FORCED_IMAGE_WORKERS
 
     image_cmd = [
@@ -274,7 +274,7 @@ def run_image_extraction_block(
     return wrapped
 
 # ------------------------------------------------------------------------------
-# /extract/images  (image-only; EXACT limiter-6 path; workers forced to 8)
+# /extract/images  (image-only; EXACT limiter-6 path; workers forced to 6)
 # ------------------------------------------------------------------------------
 @app.post("/extract/images")
 async def extract_images(
@@ -295,7 +295,7 @@ async def extract_images(
     IMAGE-ONLY endpoint that routes through the proven limiter-6 code path:
     - Uses Supabase upload logic
     - Returns the exact wrapped shape with slim items
-    - Forces workers=8 (ignoring input workers)
+    - Forces workers=6 (ignoring input workers)
     """
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -333,7 +333,7 @@ async def extract_images(
 async def extract_tables(
     file: UploadFile = File(...),
     min_quality: float = Form(0.3),
-    workers: int = Form(4),
+    workers: int = Form(6),
     no_verification: bool = Form(False),
     table_timeout_s: int = Form(900),
     # optional page windowing knobs (safe no-ops if unused)
@@ -444,7 +444,7 @@ async def extract_tables(
 @app.post("/extract/all")
 async def extract_all(
     file: UploadFile = File(...),
-    # Images knobs (workers are still clamped to 8 internally)
+    # Images knobs (workers are still clamped to 6 internally)
     min_quality: float = Form(0.3),
     min_width: int = Form(100),
     min_height: int = Form(100),
@@ -454,7 +454,7 @@ async def extract_all(
     # Tables off by default to mimic your successful “tables disabled” runs
     include_tables: bool = Form(False),
     table_timeout_s: int = Form(900),
-    workers: int = Form(4),  # only used for tables if include_tables=True
+    workers: int = Form(6),  # only used for tables if include_tables=True
     no_verification: bool = Form(False),
 
     # Optional page windowing for tables
