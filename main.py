@@ -139,7 +139,7 @@ async def extract_images_only(
     file: UploadFile = File(...),
     # Image extractor knobs (kept identical)
     min_quality: float = Form(0.3),
-    workers: int = Form(4),
+    workers: int = Form(16),
     min_width: int = Form(100),
     min_height: int = Form(100),
     page_limit: Optional[int] = Form(None),
