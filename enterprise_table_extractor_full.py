@@ -813,87 +813,109 @@ class EnterpriseTableExtractor:
         return unique_tables
     
     def _save_table(self, table_info: Dict):
-        """Save table to CSV file with atomic write - FIXED VERSION"""
-        page_num = table_info['page']
-        # Use the pre-calculated index from table_info
-        table_idx = table_info.get('table_index')
-        if table_idx is None:
-            table_idx = self._next_index_for_page(page_num)
-            table_info['table_index'] = table_idx
+    """Save table to CSV file with atomic write - FIXED VERSION"""
+    page_num = table_info['page']
+    # Use the pre-calculated index from table_info
+    table_idx = table_info.get('table_index')
+    if table_idx is None:
+        table_idx = self._next_index_for_page(page_num)
+        table_info['table_index'] = table_idx
+    
+    # Add extraction method suffix to prevent collisions
+    method_suffix = table_info.get('extraction_method', 'unknown')
+    filename = f"table_p{page_num:03d}_t{table_idx:03d}_{method_suffix}.csv"
+    filepath = self.output_dir / filename
+    
+    try:
+        # Convert to DataFrame with error handling
+        table_data = table_info.get('data')
+        if not table_data or not isinstance(table_data, list):
+            logger.error(f"Invalid table data structure for page {page_num}, table {table_idx}")
+            return
         
-        # Add extraction method suffix to prevent collisions
-        method_suffix = table_info.get('extraction_method', 'unknown')
-        filename = f"table_p{page_num:03d}_t{table_idx:03d}_{method_suffix}.csv"
-        filepath = self.output_dir / filename
+        # Ensure all rows are lists
+        cleaned_data = []
+        for row in table_data:
+            if isinstance(row, list):
+                cleaned_data.append(row)
+            else:
+                logger.warning(f"Skipping non-list row in table {table_idx} on page {page_num}")
         
+        if not cleaned_data:
+            logger.error(f"No valid data rows for table {table_idx} on page {page_num}")
+            return
+        
+        # Create DataFrame
         try:
-            # Convert to DataFrame
-            df = pd.DataFrame(table_info['data'])
-            
-            # Check if first row is headers
-            if table_info.get('has_headers', True) and len(df) > 0:
-                first_row = df.iloc[0]
-                is_header_row = any(
-                    not pd.api.types.is_numeric_dtype(type(val))
-                    for val in first_row if pd.notna(val)
-                )
-                
-                if is_header_row:
-                    df.columns = df.iloc[0]
-                    df = df[1:].reset_index(drop=True)
-            
-            # Atomic write
-            if not self._atomic_write_csv(df, filepath):
-                raise Exception("Atomic write failed")
-            
-            # Verify file exists
-            if not filepath.exists():
-                raise Exception("File not found after write")
-            
-            # Create metadata
-            metadata = TableMetadata(
-                filename=filename,
-                page_number=page_num,
-                table_index=table_idx,
-                extraction_method=table_info['extraction_method'],
-                quality_score=table_info['quality_score'],
-                table_type=table_info['table_type'],
-                rows=len(df),
-                columns=len(df.columns),
-                size_bytes=filepath.stat().st_size,
-                has_headers=table_info.get('has_headers', True),
-                numeric_percentage=self._calculate_numeric_percentage(df),
-                empty_cell_percentage=self._calculate_empty_percentage(df),
-                extraction_timestamp=datetime.now().isoformat(),
-                metadata=table_info.get('type_metadata', {})
+            df = pd.DataFrame(cleaned_data)
+        except Exception as e:
+            logger.error(f"DataFrame creation failed for table {table_idx} on page {page_num}: {e}")
+            return
+        
+        # Check if first row is headers
+        if table_info.get('has_headers', True) and len(df) > 0:
+            first_row = df.iloc[0]
+            is_header_row = any(
+                not pd.api.types.is_numeric_dtype(type(val))
+                for val in first_row if pd.notna(val)
             )
             
-            # Thread-safe update
-            with self._tables_lock:
-                self.extracted_tables.append(metadata)
-                
-                # Update statistics
-                if metadata.quality_score >= 0.7:
-                    self.extraction_stats['quality_distribution']['high'] += 1
-                elif metadata.quality_score >= 0.4:
-                    self.extraction_stats['quality_distribution']['medium'] += 1
-                else:
-                    self.extraction_stats['quality_distribution']['low'] += 1
-                
-                self.extraction_stats['table_types_found'][metadata.table_type] += 1
+            if is_header_row:
+                df.columns = df.iloc[0]
+                df = df[1:].reset_index(drop=True)
+        
+        # Atomic write
+        if not self._atomic_write_csv(df, filepath):
+            raise Exception("Atomic write failed")
+        
+        # Verify file exists
+        if not filepath.exists():
+            raise Exception("File not found after write")
+        
+        # Create metadata
+        metadata = TableMetadata(
+            filename=filename,
+            page_number=page_num,
+            table_index=table_idx,
+            extraction_method=table_info['extraction_method'],
+            quality_score=table_info['quality_score'],
+            table_type=table_info['table_type'],
+            rows=len(df),
+            columns=len(df.columns),
+            size_bytes=filepath.stat().st_size,
+            has_headers=table_info.get('has_headers', True),
+            numeric_percentage=self._calculate_numeric_percentage(df),
+            empty_cell_percentage=self._calculate_empty_percentage(df),
+            extraction_timestamp=datetime.now().isoformat(),
+            metadata=table_info.get('type_metadata', {})
+        )
+        
+        # Thread-safe update
+        with self._tables_lock:
+            self.extracted_tables.append(metadata)
             
-            logger.debug(f"Saved {filename} - Type: {metadata.table_type}, "
-                       f"Quality: {metadata.quality_score:.2f}, "
-                       f"Rows: {metadata.rows}, Cols: {metadata.columns}")
+            # Update statistics
+            if metadata.quality_score >= 0.7:
+                self.extraction_stats['quality_distribution']['high'] += 1
+            elif metadata.quality_score >= 0.4:
+                self.extraction_stats['quality_distribution']['medium'] += 1
+            else:
+                self.extraction_stats['quality_distribution']['low'] += 1
             
-        except Exception as e:
-            logger.error(f"Failed to save table: {e}")
-            self.extraction_stats['extraction_errors'].append({
-                'page': page_num,
-                'table': table_idx,
-                'error': str(e)
-            })
-    
+            self.extraction_stats['table_types_found'][metadata.table_type] += 1
+        
+        logger.debug(f"Saved {filename} - Type: {metadata.table_type}, "
+                   f"Quality: {metadata.quality_score:.2f}, "
+                   f"Rows: {metadata.rows}, Cols: {metadata.columns}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save table: {e}")
+        self.extraction_stats['extraction_errors'].append({
+            'page': page_num,
+            'table': table_idx,
+            'error': str(e)
+        }) 
+        
     def _calculate_numeric_percentage(self, df: pd.DataFrame) -> float:
         """Calculate percentage of numeric cells"""
         total_cells = df.size
