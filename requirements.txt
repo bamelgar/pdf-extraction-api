@@ -11,3 +11,4 @@ PyMuPDF==1.23.8
 tabula-py==2.8.2
 camelot-py[cv]==0.11.0
 requests==2.31.0
+aiohttp==3.9.1
