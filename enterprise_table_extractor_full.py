@@ -833,11 +833,18 @@ class EnterpriseTableExtractor:
             logger.error(f"Invalid table data structure for page {page_num}, table {table_idx}")
             return
         
-        # Ensure all rows are lists
+        # Ensure all rows are lists and normalize column count
         cleaned_data = []
+        max_cols = 0
+        
         for row in table_data:
             if isinstance(row, list):
                 cleaned_data.append(row)
+                max_cols = max(max_cols, len(row))
+            elif isinstance(row, (tuple, np.ndarray)):
+                # Handle tuples and numpy arrays (common in 10-K extraction)
+                cleaned_data.append(list(row))
+                max_cols = max(max_cols, len(row))
             else:
                 logger.warning(f"Skipping non-list row in table {table_idx} on page {page_num}")
         
@@ -845,9 +852,17 @@ class EnterpriseTableExtractor:
             logger.error(f"No valid data rows for table {table_idx} on page {page_num}")
             return
         
+        # Normalize row lengths (important for 10-K tables with irregular structure)
+        normalized_data = []
+        for row in cleaned_data:
+            if len(row) < max_cols:
+                # Pad with empty strings
+                row = row + [''] * (max_cols - len(row))
+            normalized_data.append(row)
+        
         # Create DataFrame
         try:
-            df = pd.DataFrame(cleaned_data)
+            df = pd.DataFrame(normalized_data)
         except Exception as e:
             logger.error(f"DataFrame creation failed for table {table_idx} on page {page_num}: {e}")
             return
@@ -914,7 +929,7 @@ class EnterpriseTableExtractor:
             'page': page_num,
             'table': table_idx,
             'error': str(e)
-        }) 
+        })
         
     def _calculate_numeric_percentage(self, df: pd.DataFrame) -> float:
         """Calculate percentage of numeric cells"""
